@@ -11,13 +11,18 @@ from PyQt6.QtWidgets import QApplication
 from backend.api import app as flask_app, init_extra_tables
 from gui.app import SOCDashboard
 from core.detector import detect_event, check_anomaly
+from core.ai_analyzer import analyze_log
+from core.schema import ensure_incident_schema
 from login import LoginWindow
 from threat_intel import init_threat_table
-from responder import init_responder_tables
+from responder import block_ip, init_responder_tables
+from sandbox_integrations import extract_observables, init_sandbox_tables, submit_observable_async
 
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "incidents.db")
+ensure_incident_schema(DB_PATH)
 init_responder_tables(DB_PATH)
+init_sandbox_tables(DB_PATH)
 dedup_cache = {}
 DEDUP_WINDOW = 30
 
@@ -46,15 +51,7 @@ def get_blocklist():
 def engine_listener():
     print(f"[*] Engine starting. Database Path: {DB_PATH}")
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS incidents
-            (id INTEGER PRIMARY KEY AUTOINCREMENT,
-             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-             source_ip TEXT, event_type TEXT, severity TEXT,
-             category TEXT, status TEXT)''')
-        conn.commit()
-        conn.close()
+        ensure_incident_schema(DB_PATH)
         print("[*] Database ready.")
     except Exception as e:
         print(f"Database Init Error: {e}")
@@ -97,11 +94,24 @@ def engine_listener():
                 severity = "CRITICAL"
                 category = "ML Detection"
 
+            ai = analyze_log(log, sip, etype, severity, anomaly_score)
+            status = "Logged"
+            if ai.get("auto_block"):
+                block_ip(DB_PATH, sip, f"Auto-block: AI threat score {ai['threat_score']}")
+                status = "Blocked"
+
+            for observable in extract_observables(log):
+                submit_observable_async(DB_PATH, observable, sip)
+
             with sqlite3.connect(DB_PATH, timeout=10) as db_conn:
                 db_conn.execute("""INSERT INTO incidents
-                    (source_ip, event_type, severity, category, status)
-                    VALUES (?, ?, ?, ?, ?)""", (sip, etype, severity, category, "Logged"))
-            print(f"[+] Alert Logged: {etype} ({severity}) from {sip}")
+                    (source_ip, event_type, severity, category, status, raw_log,
+                     anomaly_score, threat_score, ai_score, ai_summary)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+                        sip, etype, severity, category, status, log,
+                        float(anomaly_score), ai["threat_score"], ai["ai_score"], ai["ai_summary"]
+                    ))
+            print(f"[+] Alert Logged: {etype} ({severity}) from {sip} | threat={ai['threat_score']}")
 
         except Exception as e:
             print(f"Engine Loop Error: {e}")
@@ -123,8 +133,10 @@ def _load_or_create_api_key(db_path: str) -> str:
 def run_api(api_key: str):
     flask_app.config["DB_PATH"] = DB_PATH
     flask_app.config["API_KEY"] = api_key
+    ensure_incident_schema(DB_PATH)
     init_extra_tables(DB_PATH)
     init_threat_table(DB_PATH)
+    init_sandbox_tables(DB_PATH)
     print(f"[*] API starting. Pointing to: {DB_PATH}")
     flask_app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
 

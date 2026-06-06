@@ -32,7 +32,8 @@ EMAIL_COOLDOWN = 300  # seconds between same alert emails
 # ── DB Setup ──────────────────────────────────────────────────────────────────
 
 def init_responder_tables(db_path: str):
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS email_config (
                 key   TEXT PRIMARY KEY,
@@ -47,6 +48,12 @@ def init_responder_tables(db_path: str):
                 added_at   DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(blocklist)").fetchall()}
+        if "added_at" not in columns:
+            conn.execute("ALTER TABLE blocklist ADD COLUMN added_at DATETIME")
+            if "blocked_at" in columns:
+                conn.execute("UPDATE blocklist SET added_at = blocked_at WHERE added_at IS NULL")
+            conn.execute("UPDATE blocklist SET added_at = CURRENT_TIMESTAMP WHERE added_at IS NULL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS quarantine (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,6 +100,8 @@ def init_responder_tables(db_path: str):
                 default_rules
             )
         conn.commit()
+    finally:
+        conn.close()
 
 # ── Email Config ──────────────────────────────────────────────────────────────
 
@@ -175,6 +184,7 @@ def block_ip(db_path: str, ip: str, reason: str = "Auto-blocked by rule engine")
                 "INSERT OR IGNORE INTO blocklist (ip, reason) VALUES (?, ?)",
                 (ip, reason)
             )
+            conn.execute("UPDATE incidents SET status = ? WHERE source_ip = ?", ("Blocked", ip))
             conn.commit()
         print(f"[BLOCK] {ip} — {reason}")
         return True

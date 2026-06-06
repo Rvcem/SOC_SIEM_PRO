@@ -1,6 +1,9 @@
 from flask import Flask, jsonify, request
 import sqlite3
+import os
+import secrets
 from functools import wraps
+from core.schema import ensure_incident_schema
 
 app = Flask(__name__)
 
@@ -9,28 +12,37 @@ def _require_api_key(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         key = app.config.get("API_KEY")
-        if key:
-            provided = request.headers.get("X-API-Key", "")
-            if provided != key:
-                return jsonify({"error": "Unauthorized"}), 401
+        if not key:
+            return jsonify({"error": "API key is not configured"}), 503
+        provided = request.headers.get("X-API-Key", "")
+        if not secrets.compare_digest(provided, key):
+            return jsonify({"error": "Unauthorized"}), 401
         return f(*args, **kwargs)
     return decorated
 
 
 def get_db_connection():
     db_path = app.config.get("DB_PATH", "incidents.db")
+    ensure_incident_schema(db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_extra_tables(db_path):
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         conn.execute("""CREATE TABLE IF NOT EXISTS blocklist
             (id INTEGER PRIMARY KEY AUTOINCREMENT,
              ip TEXT UNIQUE,
              reason TEXT,
-             blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+             added_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(blocklist)").fetchall()}
+        if "added_at" not in columns:
+            conn.execute("ALTER TABLE blocklist ADD COLUMN added_at DATETIME")
+            if "blocked_at" in columns:
+                conn.execute("UPDATE blocklist SET added_at = blocked_at WHERE added_at IS NULL")
+            conn.execute("UPDATE blocklist SET added_at = CURRENT_TIMESTAMP WHERE added_at IS NULL")
         conn.execute("""CREATE TABLE IF NOT EXISTS quarantine
             (id INTEGER PRIMARY KEY AUTOINCREMENT,
              incident_id INTEGER,
@@ -38,9 +50,13 @@ def init_extra_tables(db_path):
              event_type TEXT,
              quarantined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
              notes TEXT)""")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @app.route("/incidents", methods=["GET"])
+@_require_api_key
 def get_incidents():
     try:
         conn = get_db_connection()
@@ -68,10 +84,11 @@ def update_status(incident_id):
 
 
 @app.route("/blocklist", methods=["GET"])
+@_require_api_key
 def get_blocklist():
     try:
         conn = get_db_connection()
-        rows = conn.execute("SELECT * FROM blocklist ORDER BY blocked_at DESC").fetchall()
+        rows = conn.execute("SELECT * FROM blocklist ORDER BY added_at DESC").fetchall()
         conn.close()
         return jsonify([dict(r) for r in rows])
     except Exception as e:
@@ -129,6 +146,7 @@ def quarantine_incident(incident_id):
 
 
 @app.route("/quarantine", methods=["GET"])
+@_require_api_key
 def get_quarantine():
     try:
         conn = get_db_connection()
@@ -141,4 +159,11 @@ def get_quarantine():
 
 
 if __name__ == "__main__":
+    db_path = os.getenv("SOC_DB_PATH", "incidents.db")
+    app.config["DB_PATH"] = db_path
+    app.config["API_KEY"] = os.getenv("SOC_API_KEY", "")
+    ensure_incident_schema(db_path)
+    init_extra_tables(db_path)
+    if not app.config["API_KEY"]:
+        print("[API] SOC_API_KEY is not set; routes will reject requests.")
     app.run(port=5000)

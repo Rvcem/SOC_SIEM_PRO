@@ -4,6 +4,10 @@ import re
 import time
 from collections import defaultdict
 from core.detector import detect_event, check_anomaly, extract_ip
+from core.ai_analyzer import analyze_log
+from core.schema import ensure_incident_schema
+from responder import block_ip, init_responder_tables
+from sandbox_integrations import extract_observables, init_sandbox_tables, submit_observable_async
 
 DEDUP_WINDOW = 30
 ANOMALY_THRESHOLD = 2.5
@@ -22,13 +26,11 @@ def _is_duplicate(ip, etype):
 
 def start_listener(host='0.0.0.0', port=5555):
     print("--- ENGINE STARTING ---")
+    ensure_incident_schema("incidents.db")
+    init_responder_tables("incidents.db")
+    init_sandbox_tables("incidents.db")
     conn = sqlite3.connect('incidents.db', check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS incidents
-        (id INTEGER PRIMARY KEY AUTOINCREMENT,
-         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-         source_ip TEXT, event_type TEXT, severity TEXT,
-         category TEXT, status TEXT)''')
     conn.commit()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -65,11 +67,23 @@ def start_listener(host='0.0.0.0', port=5555):
                 severity = "CRITICAL"
                 category = "ML Detection"
 
+            ai = analyze_log(raw_log, sip, etype, severity, anomaly_score)
+            status = "Logged"
+            if ai.get("auto_block"):
+                block_ip("incidents.db", sip, f"Auto-block: AI threat score {ai['threat_score']}")
+                status = "Blocked"
+            for observable in extract_observables(raw_log):
+                submit_observable_async("incidents.db", observable, sip)
+
             cursor.execute(
-                "INSERT INTO incidents (source_ip, event_type, severity, category, status) VALUES (?, ?, ?, ?, ?)",
-                (sip, etype, severity, category, "Logged")
+                """INSERT INTO incidents
+                   (source_ip, event_type, severity, category, status, raw_log,
+                    anomaly_score, threat_score, ai_score, ai_summary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (sip, etype, severity, category, status, raw_log,
+                 float(anomaly_score), ai["threat_score"], ai["ai_score"], ai["ai_summary"])
             )
             conn.commit()
-            print(f"[+] {etype} ({severity}) from {sip}")
+            print(f"[+] {etype} ({severity}) from {sip} | threat={ai['threat_score']}")
         except Exception as e:
             print(f"[ENGINE ERROR] {e}")

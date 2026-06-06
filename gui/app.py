@@ -1,4 +1,4 @@
-import sys, io, folium, requests, pyqtgraph as pg, threading
+import sys, io, json, folium, requests, pyqtgraph as pg, threading
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import *
@@ -6,6 +6,7 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from fpdf import FPDF
 from collections import Counter, defaultdict
 from datetime import datetime
+from core.schema import get_app_config, set_app_config
 from threat_intel import get_threat_score_async, score_to_label
 from responder import (
     init_responder_tables, load_email_config, save_email_config,
@@ -172,6 +173,8 @@ class SOCDashboard(QMainWindow):
         self._threat_lock  = threading.Lock()
         self.settings      = {"host": "127.0.0.1", "port": 5000, "refresh": 500, "limit": 50}
         self.email_cfg     = load_email_config(db_path) if db_path else {}
+        self.gui_zoom      = self._load_int_pref("gui_zoom", 10)
+        self.alert_split_sizes = self._load_json_pref("alert_split_sizes", [900, 520])
 
         if db_path:
             init_responder_tables(db_path)
@@ -186,6 +189,27 @@ class SOCDashboard(QMainWindow):
         QTimer.singleShot(1500, self.update_world_map)
         QTimer.singleShot(500,  self._refresh_blocklist_tab)
         QTimer.singleShot(500,  self._refresh_rules_tab)
+
+    def _load_int_pref(self, key, default):
+        if not self.db_path:
+            return default
+        try:
+            return int(get_app_config(self.db_path, key, default))
+        except Exception:
+            return default
+
+    def _load_json_pref(self, key, default):
+        if not self.db_path:
+            return default
+        try:
+            value = get_app_config(self.db_path, key, None)
+            return json.loads(value) if value else default
+        except Exception:
+            return default
+
+    def _save_pref(self, key, value):
+        if self.db_path:
+            set_app_config(self.db_path, key, json.dumps(value) if isinstance(value, (list, dict)) else value)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -256,7 +280,9 @@ class SOCDashboard(QMainWindow):
         self._build_tab_rules()
 
     def _build_tab_alerts(self):
-        tab = QWidget(); tl = QHBoxLayout(tab); left = QVBoxLayout()
+        tab = QWidget(); tl = QVBoxLayout(tab)
+        self.alert_splitter = QSplitter(Qt.Orientation.Horizontal)
+        left_widget = QWidget(); left = QVBoxLayout(left_widget)
         self.graph_card = QFrame(); self.graph_card.setObjectName("Card")
         gv = QVBoxLayout(self.graph_card); gv.addWidget(QLabel("INCIDENT TREND (LIVE)"))
         self.graph_widget = pg.PlotWidget(); self.graph_widget.setBackground("#161633")
@@ -270,24 +296,47 @@ class SOCDashboard(QMainWindow):
         mh.addStretch(); mh.addWidget(self.btn_refresh_map); mv.addLayout(mh)
         self.web_view = QWebEngineView(); self.web_view.setFixedHeight(300)
         mv.addWidget(self.web_view); left.addWidget(self.map_card, 1)
-        tl.addLayout(left, 2)
-        right = QVBoxLayout()
+        right_widget = QWidget(); right = QVBoxLayout(right_widget)
         self.risk_card = QFrame(); self.risk_card.setObjectName("Card")
         rv = QVBoxLayout(self.risk_card); rv.addWidget(QLabel("CURRENT RISK LEVEL"))
         self.lbl_risk = QLabel("NORMAL")
         self.lbl_risk.setStyleSheet("font-size: 35px; color: #00ff88; font-weight: bold;")
         rv.addWidget(self.lbl_risk, alignment=Qt.AlignmentFlag.AlignCenter)
         right.addWidget(self.risk_card)
+        tools = QHBoxLayout()
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Search by IP, country, event, severity, threat...")
         self.search_bar.textChanged.connect(self.filter_table)
-        right.addWidget(self.search_bar)
+        btn_zoom_out = QPushButton("-")
+        btn_zoom_in = QPushButton("+")
+        btn_zoom_out.setFixedWidth(34); btn_zoom_in.setFixedWidth(34)
+        btn_zoom_out.clicked.connect(lambda: self._set_zoom(self.gui_zoom - 1))
+        btn_zoom_in.clicked.connect(lambda: self._set_zoom(self.gui_zoom + 1))
+        tools.addWidget(self.search_bar)
+        tools.addWidget(btn_zoom_out)
+        tools.addWidget(btn_zoom_in)
+        right.addLayout(tools)
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(["Timestamp","Source IP","Country","Type","Severity","Threat Score","Status"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_status_menu)
-        right.addWidget(self.table); tl.addLayout(right, 1)
+        self.table.itemSelectionChanged.connect(self._show_selected_alert_details)
+        right.addWidget(self.table, 3)
+        self.details_card = QFrame(); self.details_card.setObjectName("Card")
+        dv = QVBoxLayout(self.details_card)
+        dv.addWidget(QLabel("FULL INCIDENT DETAILS"))
+        self.detail_text = QTextEdit()
+        self.detail_text.setReadOnly(True)
+        self.detail_text.setMinimumHeight(150)
+        self.detail_text.setStyleSheet("background-color:#101028; color:#ffffff; border:1px solid #2e2e66;")
+        dv.addWidget(self.detail_text)
+        right.addWidget(self.details_card, 1)
+        self.alert_splitter.addWidget(left_widget)
+        self.alert_splitter.addWidget(right_widget)
+        self.alert_splitter.setSizes(self.alert_split_sizes)
+        tl.addWidget(self.alert_splitter)
+        self._apply_zoom()
         self.tabs.addTab(tab, "🔴 Live Alerts")
 
     def _build_tab_stats(self):
@@ -365,9 +414,9 @@ class SOCDashboard(QMainWindow):
 
     def _build_tab_threat(self):
         tab = QWidget(); tl = QVBoxLayout(tab)
-        tl.addWidget(QLabel("THREAT INTELLIGENCE — AbuseIPDB Live Feed"))
-        self.threat_table = QTableWidget(0, 6)
-        self.threat_table.setHorizontalHeaderLabels(["IP","Abuse Score","Risk Level","Country","ISP","Total Reports"])
+        tl.addWidget(QLabel("THREAT INTELLIGENCE — AbuseIPDB + AI Analysis"))
+        self.threat_table = QTableWidget(0, 8)
+        self.threat_table.setHorizontalHeaderLabels(["IP","Combined","AI","AbuseIPDB","Risk Level","Country","ISP","AI Summary"])
         self.threat_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         tl.addWidget(self.threat_table)
         self.tabs.addTab(tab, "🌐 Threat Intel")
@@ -439,6 +488,57 @@ class SOCDashboard(QMainWindow):
         vl.addWidget(lbl_t); vl.addWidget(lbl_v)
         return card, lbl_v
 
+    def _set_zoom(self, value):
+        self.gui_zoom = max(8, min(18, int(value)))
+        self._save_pref("gui_zoom", self.gui_zoom)
+        self._apply_zoom()
+
+    def _apply_zoom(self):
+        font = QFont("Segoe UI", self.gui_zoom)
+        for widget_name in ("table", "threat_table", "blocklist_table", "rules_table", "stats_table"):
+            widget = getattr(self, widget_name, None)
+            if widget:
+                widget.setFont(font)
+                widget.verticalHeader().setDefaultSectionSize(max(24, self.gui_zoom + 16))
+        if hasattr(self, "detail_text"):
+            self.detail_text.setFont(QFont("Consolas", self.gui_zoom))
+
+    def _show_selected_alert_details(self):
+        row = self.table.currentRow() if hasattr(self, "table") else -1
+        if row < 0 or not hasattr(self, "detail_text"):
+            return
+        id_item = self.table.item(row, 0)
+        alert_id = id_item.data(Qt.ItemDataRole.UserRole) if id_item else None
+        alert = next((a for a in self._all_alerts if a.get("id") == alert_id), None)
+        if not alert:
+            return
+        ip = str(alert.get("source_ip", ""))
+        with self._threat_lock:
+            threat = self._threat_cache.get(ip, {})
+        combined = max(int(alert.get("threat_score") or 0), int(alert.get("ai_score") or 0), int(threat.get("abuse_score") or 0))
+        lines = [
+            f"ID: {alert.get('id')}",
+            f"Time: {alert.get('timestamp')}",
+            f"Source IP: {ip}",
+            f"Event: {alert.get('event_type')} | Severity: {alert.get('severity')} | Category: {alert.get('category')}",
+            f"Status: {alert.get('status')}",
+            f"Combined Threat Score: {combined}",
+            f"AI Score: {alert.get('ai_score', 0)} | AbuseIPDB: {threat.get('abuse_score', 'unknown')} | Anomaly: {alert.get('anomaly_score', 0)}",
+            "",
+            "AI Summary:",
+            str(alert.get("ai_summary") or "No AI summary stored for this incident."),
+            "",
+            "Raw Log:",
+            str(alert.get("raw_log") or "Raw log was not stored for this older incident."),
+        ]
+        self.detail_text.setPlainText("\n".join(lines))
+
+    def closeEvent(self, event):
+        if hasattr(self, "alert_splitter"):
+            self._save_pref("alert_split_sizes", self.alert_splitter.sizes())
+        self._save_pref("gui_zoom", self.gui_zoom)
+        super().closeEvent(event)
+
     def _on_action_taken(self, ip, action_str):
         self.lbl_action.setText(f"⚡ {action_str}  [{ip}]")
         QTimer.singleShot(5000, lambda: self.lbl_action.setText(""))
@@ -466,7 +566,7 @@ class SOCDashboard(QMainWindow):
         try:
             limit = self.settings.get("limit", 50)
             url = f"http://{self.settings['host']}:{self.settings['port']}/incidents?limit={limit}"
-            r = requests.get(url, timeout=1)
+            r = requests.get(url, headers=self._api_headers(), timeout=1)
             if r.status_code == 200:
                 data = r.json()
                 if data:
@@ -517,17 +617,48 @@ class SOCDashboard(QMainWindow):
     def _refresh_threat_tab(self):
         with self._threat_lock:
             snapshot = dict(self._threat_cache)
-        rows = sorted(snapshot.values(), key=lambda x: x.get("abuse_score", 0), reverse=True)
+        alert_scores = {}
+        for alert in self._all_alerts:
+            ip = str(alert.get("source_ip", ""))
+            if not ip:
+                continue
+            current = alert_scores.get(ip, {"threat_score": 0, "ai_score": 0, "ai_summary": ""})
+            current["threat_score"] = max(current["threat_score"], int(alert.get("threat_score") or 0))
+            current["ai_score"] = max(current["ai_score"], int(alert.get("ai_score") or 0))
+            if alert.get("ai_summary"):
+                current["ai_summary"] = str(alert.get("ai_summary"))
+            alert_scores[ip] = current
+        ips = set(snapshot.keys()) | set(alert_scores.keys())
+        rows = []
+        for ip in ips:
+            intel = snapshot.get(ip, {"ip": ip})
+            scores = alert_scores.get(ip, {})
+            abuse = int(intel.get("abuse_score") or 0)
+            combined = max(abuse, int(scores.get("threat_score") or 0), int(scores.get("ai_score") or 0))
+            row = dict(intel)
+            row.update(scores)
+            row["combined_score"] = combined
+            rows.append(row)
+        rows = sorted(rows, key=lambda x: x.get("combined_score", 0), reverse=True)
         self.threat_table.clearContents(); self.threat_table.setRowCount(len(rows))
         malicious = 0
         for i, info in enumerate(rows):
-            score = info.get("abuse_score", 0)
+            score = int(info.get("combined_score", 0))
+            abuse = int(info.get("abuse_score") or 0)
+            ai_score = int(info.get("ai_score") or 0)
             label, color = score_to_label(score)
             if score >= 25:
                 malicious += 1
-            items = [QTableWidgetItem(info.get("ip","")), QTableWidgetItem(str(score)),
-                     QTableWidgetItem(label), QTableWidgetItem(info.get("country","Unknown")),
-                     QTableWidgetItem(info.get("isp","Unknown")), QTableWidgetItem(str(info.get("total_reports",0)))]
+            items = [
+                QTableWidgetItem(info.get("ip","")),
+                QTableWidgetItem(str(score)),
+                QTableWidgetItem(str(ai_score)),
+                QTableWidgetItem(str(abuse)),
+                QTableWidgetItem(label),
+                QTableWidgetItem(info.get("country","Unknown")),
+                QTableWidgetItem(info.get("isp","Unknown")),
+                QTableWidgetItem(str(info.get("ai_summary",""))[:180]),
+            ]
             for j, item in enumerate(items):
                 item.setForeground(QColor(color))
                 self.threat_table.setItem(i, j, item)
@@ -625,12 +756,12 @@ class SOCDashboard(QMainWindow):
     def process_incoming_alerts(self, data):
         self._all_alerts = data
         try:
+            previous_ids = set(self._prev_ids)
             new_ids = {a.get("id") for a in data}
-            new_criticals = [a for a in data if a.get("id") not in self._prev_ids
+            new_criticals = [a for a in data if a.get("id") not in previous_ids
                              and str(a.get("severity","")).upper() == "CRITICAL"]
             if new_criticals and HAS_SOUND:
                 threading.Thread(target=lambda: winsound.Beep(1000, 400), daemon=True).start()
-            self._prev_ids = new_ids
 
             self.lbl_total.setText(str(len(data)))
             counts = Counter(str(a.get("event_type","")).upper() for a in data)
@@ -664,12 +795,14 @@ class SOCDashboard(QMainWindow):
                 if threat_missing:
                     threading.Thread(target=self._enrich_ip, args=(ip,), daemon=True).start()
                 # Run rule engine for new alerts only
-                if alert.get("id") not in self._prev_ids and self.db_path:
+                if alert.get("id") not in previous_ids and self.db_path:
                     with self._threat_lock:
                         t_score = self._threat_cache.get(ip, {}).get("abuse_score", 0)
                     threading.Thread(target=self._run_rules, args=(ip, etype, sev, t_score), daemon=True).start()
 
+            self._prev_ids = new_ids
             self.filter_table()
+            self._refresh_threat_tab()
             self.update_stats_tab(data)
             self.update_timeline(data)
 
@@ -735,7 +868,10 @@ class SOCDashboard(QMainWindow):
             country  = geo_snap.get(ip_val,{}).get("country","Detecting...")
             color    = SEV_COLORS.get(sev_val.upper(),"#ffffff")
             t_info   = threat_snap.get(ip_val,{})
-            t_score  = t_info.get("abuse_score",-1)
+            stored_score = int(alert.get("threat_score") or 0)
+            ai_score = int(alert.get("ai_score") or 0)
+            abuse_score = int(t_info.get("abuse_score") if t_info.get("abuse_score") is not None else -1)
+            t_score  = max(stored_score, ai_score, abuse_score)
             t_label, t_color = score_to_label(t_score)
             threat_text = f"{t_label} ({t_score})" if t_score >= 0 else "CHECKING..."
             if status in ("Resolved","False Positive"):

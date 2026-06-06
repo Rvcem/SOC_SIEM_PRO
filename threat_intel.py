@@ -2,12 +2,10 @@ import requests
 import sqlite3
 import threading
 import time
-import urllib3
+import os
 from datetime import datetime, timedelta
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-ABUSEIPDB_API_KEY = "656451cac21cce3d11ca4b75f6bbafb663943dde6a07b41b20a95a3e77e507ee21d667fe1191f910"
+ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "").strip()
 CACHE_HOURS = 24  # Re-check IPs after 24 hours
 
 # ── DB Setup ──────────────────────────────────────────────────────────────────
@@ -49,6 +47,10 @@ def check_ip(ip: str) -> dict:
             "usage_type": "Private"
         }
 
+    if not ABUSEIPDB_API_KEY:
+        print("[ABUSEIPDB] ABUSEIPDB_API_KEY is not set; skipping live lookup")
+        return None
+
     try:
         response = requests.get(
             "https://api.abuseipdb.com/api/v2/check",
@@ -62,7 +64,6 @@ def check_ip(ip: str) -> dict:
                 "verbose": True
             },
             timeout=5,
-            verify=False   # bypass SSL issues on some networks
         )
 
         if response.status_code == 200:

@@ -2,6 +2,8 @@ import sys
 import sqlite3
 import hashlib
 import os
+import secrets
+from werkzeug.security import check_password_hash, generate_password_hash
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QLineEdit, QPushButton,
@@ -123,7 +125,20 @@ QLabel#role_badge {
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 def hash_password(password: str) -> str:
+    return generate_password_hash(password)
+
+
+def _legacy_sha256(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
+
+
+def _verify_password(stored_hash: str, password: str) -> bool:
+    if stored_hash == _legacy_sha256(password):
+        return True
+    try:
+        return check_password_hash(stored_hash, password)
+    except ValueError:
+        return False
 
 
 def init_users_table(db_path: str):
@@ -137,16 +152,18 @@ def init_users_table(db_path: str):
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Seed default admin if table is empty
+        # Seed a first admin if the DB is empty. Prefer an environment-provided
+        # password; otherwise generate a one-time password and print it.
         existing = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if existing == 0:
+            admin_password = os.getenv("SOC_ADMIN_PASSWORD")
+            if not admin_password:
+                admin_password = secrets.token_urlsafe(16)
+                print("[AUTH] Created first admin user: admin")
+                print(f"[AUTH] One-time admin password: {admin_password}")
             conn.execute(
                 "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-                ("admin", hash_password("admin123"), "admin")
-            )
-            conn.execute(
-                "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-                ("analyst", hash_password("analyst123"), "analyst")
+                ("admin", hash_password(admin_password), "admin")
             )
         conn.commit()
 
@@ -156,10 +173,15 @@ def verify_user(db_path: str, username: str, password: str):
     try:
         with sqlite3.connect(db_path) as conn:
             row = conn.execute(
-                "SELECT role FROM users WHERE username=? AND password=?",
-                (username, hash_password(password))
+                "SELECT id, role, password FROM users WHERE username=?",
+                (username,)
             ).fetchone()
-            return row[0] if row else None
+            if not row or not _verify_password(row[2], password):
+                return None
+            if row[2] == _legacy_sha256(password):
+                conn.execute("UPDATE users SET password=? WHERE id=?", (hash_password(password), row[0]))
+                conn.commit()
+            return row[1]
     except Exception as e:
         print(f"[AUTH ERROR] {e}")
         return None
@@ -333,8 +355,8 @@ class LoginWindow(QMainWindow):
 
         layout.addStretch()
 
-        # Default credentials hint
-        hint = QLabel("Default: admin / admin123  |  analyst / analyst123")
+        # Login hint
+        hint = QLabel("First admin password is printed in the start.py console if SOC_ADMIN_PASSWORD is not set.")
         hint.setStyleSheet("color: #2a2a5a; font-family: 'Courier New'; font-size: 9px;")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(hint)
@@ -450,7 +472,7 @@ def launch_with_login(db_path=DB_PATH):
 
     def on_login(username, role):
         nonlocal dashboard
-        dashboard = SOCDashboard(username=username, role=role)
+        dashboard = SOCDashboard(username=username, role=role, db_path=db_path)
         dashboard.show()
 
     login_win.login_successful.connect(on_login)
