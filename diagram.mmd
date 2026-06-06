@@ -1,0 +1,36 @@
+# Architecture du SIEM
+
+```mermaid
+graph TD
+    %% -- SOURCES DE DONNÉES --
+    subgraph Ingestion [INGESTION DES LOGS]
+        A[Source d'Attaque <br/> Kali Linux / Script Test] -->|UDP 5555| B{Interface Réseau}
+    end
+
+    %% -- CŒUR DU SIEM --
+    subgraph SIEM_Core [MOTEUR SIEM - start.py]
+        direction TB
+        B -->|Logs Bruts| C[Thread 1: Listener UDP]
+        C -->|Analyse Regex| D[Logique de Détection <br/> Mot-clé 'Failed']
+        D -->|Alerte Identifiée| E[Gestionnaire SQLite]
+        E -->|Écriture SQL| F[(incidents.db)]
+    end
+
+    %% -- COUCHE API --
+    subgraph API_Layer [BACKEND - backend/api.py]
+        F -.->|Lecture| G[Thread 2: API REST Flask]
+        G -->|Flux JSON| H[Endpoint: /incidents]
+    end
+
+    %% -- INTERFACE UTILISATEUR --
+    subgraph Interface [DASHBOARD SOC - gui/app.py]
+        H -->|Polling toutes les 3s| I[Thread 3: GUI PyQt6]
+        I --> J[Tableau de Bord Analyste]
+    end
+
+    %% -- STYLISATION --
+    style A fill:#ff9999,stroke:#333,stroke-width:2px
+    style SIEM_Core fill:#e1f5fe,stroke:#01579b,stroke-width:2px
+    style API_Layer fill:#fff9c4,stroke:#fbc02d,stroke-width:2px
+    style Interface fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
+    style F fill:#f5f5f5,stroke:#616161,stroke-dasharray: 5 5
