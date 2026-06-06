@@ -85,7 +85,13 @@ python start.py
 
 This starts the UDP listener, Flask API, login screen, and dashboard together.
 
-### 4. Send Demo Events
+### 4. Login
+```bash
+username : admin
+password : admin123
+```
+
+### 5. Send Demo Events
 ```bash
 python test_siem.py
 ```
