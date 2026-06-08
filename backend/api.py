@@ -4,6 +4,7 @@ import os
 import secrets
 from functools import wraps
 from core.schema import ensure_incident_schema
+from core.ollama_reporter import get_report, get_recent_reports, init_reports_table
 
 app = Flask(__name__)
 
@@ -145,6 +146,34 @@ def quarantine_incident(incident_id):
         return jsonify({"success": False}), 500
 
 
+@app.route("/reports", methods=["GET"])
+@_require_api_key
+def list_reports():
+    """Return the most recent Ollama-generated incident reports."""
+    try:
+        db_path = app.config.get("DB_PATH", "incidents.db")
+        limit   = request.args.get("limit", 20, type=int)
+        return jsonify(get_recent_reports(db_path, limit))
+    except Exception as e:
+        print(f"[API ERROR] {e}")
+        return jsonify([])
+
+
+@app.route("/reports/<int:incident_id>", methods=["GET"])
+@_require_api_key
+def get_incident_report(incident_id):
+    """Return the Ollama report for a specific incident, or 404."""
+    try:
+        db_path = app.config.get("DB_PATH", "incidents.db")
+        report  = get_report(db_path, incident_id)
+        if report:
+            return jsonify(report)
+        return jsonify({"error": "No report available yet"}), 404
+    except Exception as e:
+        print(f"[API ERROR] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/quarantine", methods=["GET"])
 @_require_api_key
 def get_quarantine():
@@ -164,6 +193,7 @@ if __name__ == "__main__":
     app.config["API_KEY"] = os.getenv("SOC_API_KEY", "")
     ensure_incident_schema(db_path)
     init_extra_tables(db_path)
+    init_reports_table(db_path)
     if not app.config["API_KEY"]:
         print("[API] SOC_API_KEY is not set; routes will reject requests.")
     app.run(port=5000)

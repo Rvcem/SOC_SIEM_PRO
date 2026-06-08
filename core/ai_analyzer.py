@@ -150,18 +150,55 @@ def ollama_log_score(raw_log: str, event_type: str, severity: str) -> dict | Non
         return None
 
 
-def analyze_log(raw_log: str, ip: str, event_type: str, severity: str, anomaly_score: float = 0) -> dict:
+def analyze_log(
+    raw_log: str,
+    ip: str,
+    event_type: str,
+    severity: str,
+    anomaly_score: float = 0,
+    vt_score: int = 0,
+    behavior_score: int = 0,
+    behavior_alerts: list = None,
+) -> dict:
     heuristic = heuristic_log_score(raw_log, ip, event_type, severity)
-    ollama = ollama_log_score(raw_log, event_type, severity)
-    ai_score = ollama["score"] if ollama else heuristic["score"]
+    ollama    = ollama_log_score(raw_log, event_type, severity)
+    ai_score  = ollama["score"] if ollama else heuristic["score"]
+
     combined = max(heuristic["score"], ai_score)
+
+    # Statistical anomaly escalation
     if anomaly_score > 2.5:
         combined = max(combined, 85)
-    summary = ollama["summary"] if ollama and ollama.get("summary") else heuristic["summary"]
+
+    # VirusTotal escalation — malicious file is strong signal
+    if vt_score >= 70:
+        combined = max(combined, vt_score)
+    elif vt_score > 0:
+        combined = max(combined, combined + (vt_score // 4))
+
+    # Behavioral analytics escalation
+    if behavior_score > 0:
+        combined = max(combined, combined + (behavior_score // 3))
+    if behavior_score >= 40:
+        combined = max(combined, 80)
+
+    combined = _clamp_score(combined)
+
+    # Build a rich summary
+    base_summary = ollama["summary"] if ollama and ollama.get("summary") else heuristic["summary"]
+    extra_parts = []
+    if vt_score > 0:
+        extra_parts.append(f"VT score: {vt_score}/100")
+    if behavior_alerts:
+        extra_parts.extend(behavior_alerts[:2])
+    summary = "; ".join(filter(None, [base_summary] + extra_parts))[:600]
+
     return {
-        "heuristic_score": heuristic["score"],
-        "ai_score": ai_score,
-        "threat_score": _clamp_score(combined),
-        "ai_summary": summary,
-        "auto_block": combined >= AUTO_BLOCK_SCORE or heuristic["auto_block"],
+        "heuristic_score":  heuristic["score"],
+        "ai_score":         ai_score,
+        "vt_score":         vt_score,
+        "behavior_score":   behavior_score,
+        "threat_score":     combined,
+        "ai_summary":       summary,
+        "auto_block":       combined >= AUTO_BLOCK_SCORE or heuristic["auto_block"],
     }

@@ -6,12 +6,15 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from fpdf import FPDF
 from collections import Counter, defaultdict
 from datetime import datetime
+import ipaddress
 from core.schema import get_app_config, set_app_config
+from core.ollama_reporter import get_recent_reports, generate_report_async
 from threat_intel import get_threat_score_async, score_to_label
 from responder import (
     init_responder_tables, load_email_config, save_email_config,
     send_alert_async, block_ip, unblock_ip, get_blocklist,
-    get_rules, add_rule, toggle_rule, delete_rule, evaluate_rules
+    get_rules_v2, add_rule_v2, update_rule_v2, delete_rule_v2,
+    toggle_rule_v2, evaluate_rules_v2,
 )
 
 try:
@@ -22,24 +25,31 @@ except ImportError:
 
 STYLE_SOC = """
     QMainWindow { background-color: #0b0b1a; }
-    QFrame#Card { background-color: #161633; border: 1px solid #2e2e66; border-radius: 12px; }
+    QFrame#Card { background-color: #161633; border: 1px solid #2e2e66; border-radius: 10px; }
     QLabel { color: #ffffff; font-family: 'Segoe UI'; }
-    QPushButton { background-color: #6c5ce7; color: white; border-radius: 8px; padding: 8px 15px; font-weight: bold; }
+    QPushButton { background-color: #6c5ce7; color: white; border-radius: 7px; padding: 5px 12px; font-weight: bold; font-size: 11px; }
     QPushButton#danger { background-color: #ff4757; }
     QPushButton#success { background-color: #00b894; }
-    QTableWidget { background-color: #161633; color: white; border: none; gridline-color: #2e2e66; }
-    QHeaderView::section { background-color: #1c1c44; color: #00f2ff; padding: 5px; }
-    QLineEdit { background-color: #1c1c44; color: white; border: 1px solid #2e2e66; border-radius: 6px; padding: 5px; }
+    QTableWidget { background-color: #161633; color: white; border: none; gridline-color: #2e2e66; alternate-background-color: #1a1a3a; }
+    QTableWidget::item:selected { background-color: #3a3a7a; color: #ffffff; }
+    QTableWidget::item:selected:active { background-color: #4a4ab0; color: #ffffff; }
+    QHeaderView::section { background-color: #1c1c44; color: #00f2ff; padding: 4px; font-size: 11px; }
+    QLineEdit { background-color: #1c1c44; color: white; border: 1px solid #2e2e66; border-radius: 5px; padding: 4px; }
     QTabWidget::pane { border: 1px solid #2e2e66; background-color: #0b0b1a; }
-    QTabBar::tab { background-color: #161633; color: #aaaaaa; padding: 8px 20px; border-radius: 6px; margin: 2px; }
+    QTabBar::tab { background-color: #161633; color: #aaaaaa; padding: 6px 14px; border-radius: 5px; margin: 2px; font-size: 11px; }
     QTabBar::tab:selected { background-color: #6c5ce7; color: white; }
-    QSpinBox { background-color: #1c1c44; color: white; border: 1px solid #2e2e66; border-radius: 6px; padding: 4px; }
-    QComboBox { background-color: #1c1c44; color: white; border: 1px solid #2e2e66; border-radius: 6px; padding: 5px; }
+    QSpinBox { background-color: #1c1c44; color: white; border: 1px solid #2e2e66; border-radius: 5px; padding: 3px; }
+    QComboBox { background-color: #1c1c44; color: white; border: 1px solid #2e2e66; border-radius: 5px; padding: 4px; }
     QComboBox::drop-down { border: none; }
     QComboBox QAbstractItemView { background-color: #161633; color: white; selection-background-color: #6c5ce7; }
     QMenu { background-color: #161633; color: white; border: 1px solid #2e2e66; }
     QMenu::item:selected { background-color: #6c5ce7; }
     QCheckBox { color: white; }
+    QScrollBar:vertical { background: #0b0b1a; width: 6px; border-radius: 3px; }
+    QScrollBar::handle:vertical { background: #2e2e66; border-radius: 3px; }
+    QScrollBar:horizontal { background: #0b0b1a; height: 6px; border-radius: 3px; }
+    QScrollBar::handle:horizontal { background: #6c5ce7; border-radius: 3px; }
+    QScrollBar::add-line, QScrollBar::sub-line { width: 0px; height: 0px; }
 """
 
 SEV_COLORS = {"CRITICAL": "#ff0000", "HIGH": "#ff4757", "MEDIUM": "#ffa502", "LOW": "#00ff88"}
@@ -51,6 +61,21 @@ EVENT_TYPES = [
 ]
 
 
+def _screen_h():
+    """Available screen height in pixels."""
+    screen = QApplication.primaryScreen()
+    if screen:
+        return screen.availableGeometry().height()
+    return 1080
+
+
+def _screen_w():
+    screen = QApplication.primaryScreen()
+    if screen:
+        return screen.availableGeometry().width()
+    return 1920
+
+
 # ── Settings Dialog ───────────────────────────────────────────────────────────
 
 class SettingsDialog(QDialog):
@@ -58,7 +83,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setStyleSheet(STYLE_SOC)
-        self.setFixedSize(460, 480)
+        self.setFixedSize(460, 460)
         self.settings = settings or {}
         self.db_path  = db_path
         layout = QVBoxLayout(self)
@@ -145,11 +170,294 @@ class SettingsDialog(QDialog):
         return self._get_email_cfg()
 
 
+# ── Condition row widget ──────────────────────────────────────────────────────
+
+class ConditionRow(QWidget):
+    removed = pyqtSignal(object)
+
+    _FIELDS = [
+        "event_type", "severity", "category", "source_ip", "raw_log",
+        "threat_score", "behavior_score", "vt_score", "anomaly_score",
+        "hour", "day_of_week",
+    ]
+    _STRING_OPS = ["contains", "eq", "neq", "regex", "in"]
+    _NUMBER_OPS = ["gte", "lte", "gt", "lt", "eq", "neq", "between", "in"]
+    _NUMERIC    = {"threat_score", "behavior_score", "vt_score",
+                   "anomaly_score", "hour", "day_of_week"}
+
+    _OP_LABELS = {
+        "eq": "=", "neq": "≠", "contains": "contains", "regex": "regex",
+        "in": "in list", "gt": ">", "lt": "<", "gte": "≥", "lte": "≤",
+        "between": "between",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(6)
+
+        self.cmb_field = QComboBox()
+        self.cmb_field.addItems(self._FIELDS)
+        self.cmb_field.setFixedWidth(130)
+        self.cmb_field.currentTextChanged.connect(self._update_ops)
+
+        self.cmb_op = QComboBox()
+        self.cmb_op.setFixedWidth(100)
+
+        self.inp_value = QLineEdit()
+        self.inp_value.setPlaceholderText("value…")
+
+        btn_rm = QPushButton("×")
+        btn_rm.setFixedWidth(28)
+        btn_rm.setStyleSheet("background:#c0392b; color:white; font-weight:bold; border-radius:4px;")
+        btn_rm.clicked.connect(lambda: self.removed.emit(self))
+
+        lay.addWidget(self.cmb_field)
+        lay.addWidget(self.cmb_op)
+        lay.addWidget(self.inp_value, 1)
+        lay.addWidget(btn_rm)
+
+        self._update_ops(self.cmb_field.currentText())
+
+    def _update_ops(self, field):
+        ops = self._NUMBER_OPS if field in self._NUMERIC else self._STRING_OPS
+        cur = self.cmb_op.currentText()
+        self.cmb_op.blockSignals(True)
+        self.cmb_op.clear()
+        self.cmb_op.addItems([self._OP_LABELS.get(o, o) for o in ops])
+        self._op_keys = ops
+        idx = ops.index(cur) if cur in ops else 0
+        self.cmb_op.setCurrentIndex(idx)
+        self.cmb_op.blockSignals(False)
+        # value hint
+        hints = {"hour": "0–23", "day_of_week": "0=Mon…6=Sun",
+                 "between": "low,high", "in": "val1, val2, …",
+                 "severity": "CRITICAL / HIGH / MEDIUM / LOW"}
+        self.inp_value.setPlaceholderText(hints.get(field, "value…"))
+
+    def to_dict(self):
+        idx = self.cmb_op.currentIndex()
+        op  = self._op_keys[idx] if hasattr(self, "_op_keys") and idx < len(self._op_keys) else "eq"
+        return {"field": self.cmb_field.currentText(),
+                "op": op,
+                "value": self.inp_value.text().strip()}
+
+    def from_dict(self, d):
+        fi = self.cmb_field.findText(d.get("field", "event_type"))
+        if fi >= 0:
+            self.cmb_field.setCurrentIndex(fi)
+        self._update_ops(self.cmb_field.currentText())
+        op = d.get("op", "eq")
+        if hasattr(self, "_op_keys") and op in self._op_keys:
+            self.cmb_op.setCurrentIndex(self._op_keys.index(op))
+        self.inp_value.setText(str(d.get("value", "")))
+
+
+# ── Rule builder dialog ───────────────────────────────────────────────────────
+
+class RuleBuilderDialog(QDialog):
+    def __init__(self, parent=None, rule=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Rule" if rule is None else f"Edit Rule — {rule.get('name','')}")
+        self.setStyleSheet(STYLE_SOC)
+        self.setMinimumSize(700, 620)
+        self._cond_rows = []
+
+        outer = QVBoxLayout(self)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{border:none;}")
+        content = QWidget()
+        lay = QVBoxLayout(content)
+        lay.setSpacing(8)
+
+        # ── Name / Description / Priority ─────────────────────────────────────
+        meta = QFrame(); meta.setObjectName("Card")
+        mf = QFormLayout(meta)
+        mf.setContentsMargins(10, 8, 10, 8)
+        self.inp_name = QLineEdit()
+        self.inp_desc = QLineEdit()
+        self.spn_prio = QSpinBox(); self.spn_prio.setRange(1, 999); self.spn_prio.setValue(50)
+        self.chk_stop = QCheckBox("Stop on match (skip lower-priority rules if this fires)")
+        mf.addRow("Name *",       self.inp_name)
+        mf.addRow("Description",  self.inp_desc)
+        mf.addRow("Priority",     self.spn_prio)
+        mf.addRow("",             self.chk_stop)
+        lay.addWidget(meta)
+
+        # ── Conditions ────────────────────────────────────────────────────────
+        cond_frame = QFrame(); cond_frame.setObjectName("Card")
+        cf = QVBoxLayout(cond_frame)
+        cf.setContentsMargins(10, 8, 10, 8)
+        ch = QHBoxLayout()
+        lbl_c = QLabel("CONDITIONS")
+        lbl_c.setStyleSheet("color:#00f2ff; font-weight:bold; letter-spacing:1px;")
+        lbl_mode = QLabel("Match:")
+        self.cmb_mode = QComboBox(); self.cmb_mode.addItems(["AND", "OR"]); self.cmb_mode.setFixedWidth(60)
+        btn_add_c = QPushButton("+ Add Condition")
+        btn_add_c.setObjectName("success")
+        btn_add_c.setFixedWidth(140)
+        btn_add_c.clicked.connect(self._add_row)
+        ch.addWidget(lbl_c); ch.addSpacing(10)
+        ch.addWidget(lbl_mode); ch.addWidget(self.cmb_mode)
+        ch.addStretch(); ch.addWidget(btn_add_c)
+        cf.addLayout(ch)
+        self.cond_layout = QVBoxLayout()
+        self.cond_layout.setSpacing(2)
+        cf.addLayout(self.cond_layout)
+        lay.addWidget(cond_frame)
+
+        # ── Threshold / Window / Scope ────────────────────────────────────────
+        tw = QFrame(); tw.setObjectName("Card")
+        twf = QHBoxLayout(tw)
+        twf.setContentsMargins(10, 8, 10, 8)
+        self.spn_thr = QSpinBox(); self.spn_thr.setRange(1, 9999); self.spn_thr.setValue(1)
+        self.spn_win = QSpinBox(); self.spn_win.setRange(0, 86400); self.spn_win.setSuffix(" s"); self.spn_win.setValue(60)
+        self.cmb_scope = QComboBox(); self.cmb_scope.addItems(["per_ip", "global"])
+        self.spn_cool = QSpinBox(); self.spn_cool.setRange(0, 86400); self.spn_cool.setSuffix(" s"); self.spn_cool.setValue(300)
+        for lbl, w in [("Threshold:", self.spn_thr), ("Window:", self.spn_win),
+                       ("Scope:", self.cmb_scope), ("Cooldown:", self.spn_cool)]:
+            twf.addWidget(QLabel(lbl)); twf.addWidget(w)
+        twf.addStretch()
+        lay.addWidget(tw)
+
+        # ── Actions ───────────────────────────────────────────────────────────
+        act_frame = QFrame(); act_frame.setObjectName("Card")
+        af = QVBoxLayout(act_frame)
+        af.setContentsMargins(10, 8, 10, 8)
+        lbl_act = QLabel("ACTIONS  (select one or more)")
+        lbl_act.setStyleSheet("color:#00f2ff; font-weight:bold; letter-spacing:1px;")
+        af.addWidget(lbl_act)
+        act_row = QHBoxLayout()
+        self.chk_block = QCheckBox("🚫 Block IP")
+        self.chk_email = QCheckBox("📧 Email Alert")
+        self.chk_quar  = QCheckBox("🔒 Quarantine")
+        self.chk_esc   = QCheckBox("⬆ Escalate to CRITICAL")
+        for c in (self.chk_block, self.chk_email, self.chk_quar, self.chk_esc):
+            act_row.addWidget(c)
+        act_row.addStretch()
+        af.addLayout(act_row)
+        wh_row = QHBoxLayout()
+        wh_row.addWidget(QLabel("Webhook URL:"))
+        self.inp_webhook = QLineEdit()
+        self.inp_webhook.setPlaceholderText("https://hooks.slack.com/… (optional)")
+        wh_row.addWidget(self.inp_webhook)
+        af.addLayout(wh_row)
+        lay.addWidget(act_frame)
+
+        # ── Exclude IPs ───────────────────────────────────────────────────────
+        excl = QFrame(); excl.setObjectName("Card")
+        ef = QHBoxLayout(excl)
+        ef.setContentsMargins(10, 8, 10, 8)
+        ef.addWidget(QLabel("Exclude IPs / CIDRs:"))
+        self.inp_excl = QLineEdit()
+        self.inp_excl.setPlaceholderText("10.0.0.0/8, 192.168.0.0/16")
+        ef.addWidget(self.inp_excl)
+        lay.addWidget(excl)
+
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btns = QHBoxLayout()
+        btn_save   = QPushButton("SAVE RULE"); btn_save.setObjectName("success")
+        btn_cancel = QPushButton("CANCEL");    btn_cancel.setStyleSheet("background:#444;")
+        btn_save.clicked.connect(self._on_save)
+        btn_cancel.clicked.connect(self.reject)
+        btns.addStretch(); btns.addWidget(btn_save); btns.addWidget(btn_cancel)
+        outer.addLayout(btns)
+
+        self._add_row()  # start with one empty condition
+        if rule:
+            self._load(rule)
+
+    def _add_row(self, data=None):
+        row = ConditionRow(self)
+        row.removed.connect(self._rm_row)
+        if data:
+            row.from_dict(data)
+        self.cond_layout.addWidget(row)
+        self._cond_rows.append(row)
+
+    def _rm_row(self, row):
+        if len(self._cond_rows) <= 1:
+            return
+        self.cond_layout.removeWidget(row)
+        row.deleteLater()
+        self._cond_rows.remove(row)
+
+    def _load(self, rule):
+        self.inp_name.setText(rule.get("name", ""))
+        self.inp_desc.setText(rule.get("description", ""))
+        self.spn_prio.setValue(int(rule.get("priority", 50)))
+        self.chk_stop.setChecked(bool(rule.get("stop_on_match", 0)))
+        self.spn_thr.setValue(int(rule.get("threshold", 1)))
+        self.spn_win.setValue(int(rule.get("window_sec", 60)))
+        self.spn_cool.setValue(int(rule.get("cooldown_sec", 300)))
+        idx = self.cmb_scope.findText(rule.get("scope", "per_ip"))
+        if idx >= 0: self.cmb_scope.setCurrentIndex(idx)
+        idx = self.cmb_mode.findText(rule.get("condition_mode", "AND"))
+        if idx >= 0: self.cmb_mode.setCurrentIndex(idx)
+        self.chk_block.setChecked(bool(rule.get("action_block", 0)))
+        self.chk_email.setChecked(bool(rule.get("action_email", 0)))
+        self.chk_quar.setChecked(bool(rule.get("action_quarantine", 0)))
+        self.chk_esc.setChecked(bool(rule.get("action_escalate", 0)))
+        self.inp_webhook.setText(rule.get("action_webhook", ""))
+        self.inp_excl.setText(rule.get("exclude_ips", ""))
+        try:
+            conds = json.loads(rule.get("conditions", "[]"))
+        except Exception:
+            conds = []
+        while self._cond_rows:
+            r = self._cond_rows[0]
+            self.cond_layout.removeWidget(r)
+            r.deleteLater()
+            self._cond_rows.clear()
+        for c in conds:
+            self._add_row(c)
+        if not self._cond_rows:
+            self._add_row()
+
+    def _on_save(self):
+        if not self.inp_name.text().strip():
+            QMessageBox.warning(self, "Validation", "Rule name is required.")
+            return
+        if not any([self.chk_block.isChecked(), self.chk_email.isChecked(),
+                    self.chk_quar.isChecked(), self.chk_esc.isChecked(),
+                    self.inp_webhook.text().strip()]):
+            QMessageBox.warning(self, "Validation", "Select at least one action.")
+            return
+        self.accept()
+
+    def get_data(self) -> dict:
+        conds = [r.to_dict() for r in self._cond_rows if r.to_dict().get("value")]
+        return {
+            "name":            self.inp_name.text().strip(),
+            "description":     self.inp_desc.text().strip(),
+            "priority":        self.spn_prio.value(),
+            "stop_on_match":   int(self.chk_stop.isChecked()),
+            "conditions":      json.dumps(conds),
+            "condition_mode":  self.cmb_mode.currentText(),
+            "threshold":       self.spn_thr.value(),
+            "window_sec":      self.spn_win.value(),
+            "scope":           self.cmb_scope.currentText(),
+            "cooldown_sec":    self.spn_cool.value(),
+            "action_block":    int(self.chk_block.isChecked()),
+            "action_email":    int(self.chk_email.isChecked()),
+            "action_quarantine": int(self.chk_quar.isChecked()),
+            "action_escalate": int(self.chk_esc.isChecked()),
+            "action_webhook":  self.inp_webhook.text().strip(),
+            "exclude_ips":     self.inp_excl.text().strip(),
+        }
+
+
 # ── Main Dashboard ────────────────────────────────────────────────────────────
 
 class SOCDashboard(QMainWindow):
     _threat_ready  = pyqtSignal(str)
-    _action_signal = pyqtSignal(str, str)   # (ip, action_str) for live feedback
+    _action_signal = pyqtSignal(str, str)
 
     def __init__(self, username="operator", role="analyst", db_path=None, api_key=None):
         super().__init__()
@@ -158,8 +466,11 @@ class SOCDashboard(QMainWindow):
         self.db_path  = db_path
         self._api_key = api_key
         self.setWindowTitle(f"SOC SIEM PRO  —  {username.upper()}  [{role.upper()}]")
-        self.resize(1400, 900)
         self.setStyleSheet(STYLE_SOC)
+
+        # Fill the screen on startup
+        screen_geom = QApplication.primaryScreen().availableGeometry()
+        self.setGeometry(screen_geom)
 
         # State
         self.trend_points  = [0]
@@ -173,8 +484,13 @@ class SOCDashboard(QMainWindow):
         self._threat_lock  = threading.Lock()
         self.settings      = {"host": "127.0.0.1", "port": 5000, "refresh": 500, "limit": 50}
         self.email_cfg     = load_email_config(db_path) if db_path else {}
+        self._reports_data = []
         self.gui_zoom      = self._load_int_pref("gui_zoom", 10)
-        self.alert_split_sizes = self._load_json_pref("alert_split_sizes", [900, 520])
+
+        sw = _screen_w()
+        default_left  = int(sw * 0.38)
+        default_right = sw - default_left - 12
+        self.alert_split_sizes = self._load_json_pref("alert_split_sizes", [default_left, default_right])
 
         if db_path:
             init_responder_tables(db_path)
@@ -187,8 +503,6 @@ class SOCDashboard(QMainWindow):
         self.timer.timeout.connect(self.fetch_data)
         self.timer.start(self.settings["refresh"])
         QTimer.singleShot(1500, self.update_world_map)
-        QTimer.singleShot(500,  self._refresh_blocklist_tab)
-        QTimer.singleShot(500,  self._refresh_rules_tab)
 
     def _load_int_pref(self, key, default):
         if not self.db_path:
@@ -217,11 +531,14 @@ class SOCDashboard(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
+        layout.setSpacing(4)
+        layout.setContentsMargins(6, 6, 6, 6)
 
-        # Header
+        # ── Header ───────────────────────────────────────────────────────────
         header = QHBoxLayout()
+        header.setSpacing(10)
         lbl_title = QLabel("SOC MONITORING ENGINE")
-        lbl_title.setStyleSheet("font-size: 22px; font-weight: bold; color: #00f2ff;")
+        lbl_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #00f2ff; letter-spacing: 2px;")
         lbl_user  = QLabel(f"👤 {self.username.upper()}  |  {self.role.upper()}")
         lbl_user.setStyleSheet("font-size: 11px; color: #6c5ce7; font-family: 'Courier New';")
         self.lbl_action = QLabel("")
@@ -229,7 +546,7 @@ class SOCDashboard(QMainWindow):
         self.btn_settings = QPushButton("SETTINGS")
         self.btn_settings.setStyleSheet("background-color: #2e2e66;")
         self.btn_settings.clicked.connect(self.open_settings)
-        self.btn_report = QPushButton("GENERATE REPORT (PDF)")
+        self.btn_report = QPushButton("EXPORT PDF")
         self.btn_report.clicked.connect(self.generate_pdf_report)
         header.addWidget(lbl_title)
         header.addWidget(lbl_user)
@@ -239,21 +556,17 @@ class SOCDashboard(QMainWindow):
         header.addWidget(self.btn_report)
         layout.addLayout(header)
 
-        # Stats bar
+        # ── Stats bar ────────────────────────────────────────────────────────
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setFixedHeight(100)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        scroll_area.setFixedHeight(84)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll_area.setStyleSheet("""
-            QScrollArea { border: none; background: transparent; }
-            QScrollBar:horizontal { background: #0b0b1a; height: 6px; border-radius: 3px; }
-            QScrollBar::handle:horizontal { background: #6c5ce7; border-radius: 3px; }
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
-        """)
+        scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         scroll_widget = QWidget(); scroll_widget.setStyleSheet("background: transparent;")
         self.stats_bar = QHBoxLayout(scroll_widget)
-        self.stats_bar.setSpacing(10); self.stats_bar.setContentsMargins(4,4,4,4)
+        self.stats_bar.setSpacing(6)
+        self.stats_bar.setContentsMargins(2, 2, 2, 2)
         self.card_total, self.lbl_total = self._make_stat_card("TOTAL ALERTS", "0", "#00f2ff")
         self.stats_bar.addWidget(self.card_total)
         self.event_type_labels = {}
@@ -269,69 +582,118 @@ class SOCDashboard(QMainWindow):
         scroll_area.setWidget(scroll_widget)
         layout.addWidget(scroll_area)
 
-        # Tabs
+        # ── Tabs ─────────────────────────────────────────────────────────────
         self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
+        layout.addWidget(self.tabs, 1)
         self._build_tab_alerts()
         self._build_tab_stats()
         self._build_tab_timeline()
         self._build_tab_threat()
+        self._build_tab_reports()
         self._build_tab_blocklist()
         self._build_tab_rules()
 
     def _build_tab_alerts(self):
+        sh = _screen_h()
+        map_h     = max(160, int(sh * 0.18))   # ~194px on 1080p
+        details_h = max(220, int(sh * 0.30))   # ~324px on 1080p
+
         tab = QWidget(); tl = QVBoxLayout(tab)
+        tl.setContentsMargins(4, 4, 4, 4)
+        tl.setSpacing(4)
         self.alert_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # ── Left panel: trend graph + map ────────────────────────────────────
         left_widget = QWidget(); left = QVBoxLayout(left_widget)
+        left.setContentsMargins(0, 0, 4, 0)
+        left.setSpacing(4)
+
         self.graph_card = QFrame(); self.graph_card.setObjectName("Card")
-        gv = QVBoxLayout(self.graph_card); gv.addWidget(QLabel("INCIDENT TREND (LIVE)"))
+        gv = QVBoxLayout(self.graph_card)
+        gv.setContentsMargins(8, 6, 8, 6)
+        gv.setSpacing(4)
+        lbl_trend = QLabel("INCIDENT TREND (LIVE)")
+        lbl_trend.setStyleSheet("font-size: 10px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
+        gv.addWidget(lbl_trend)
         self.graph_widget = pg.PlotWidget(); self.graph_widget.setBackground("#161633")
-        self.curve = self.graph_widget.plot(pen=pg.mkPen(color="#00f2ff", width=3))
-        gv.addWidget(self.graph_widget); left.addWidget(self.graph_card, 1)
+        self.curve = self.graph_widget.plot(pen=pg.mkPen(color="#00f2ff", width=2))
+        gv.addWidget(self.graph_widget)
+        left.addWidget(self.graph_card, 1)
+
         self.map_card = QFrame(); self.map_card.setObjectName("Card")
-        mv = QVBoxLayout(self.map_card); mh = QHBoxLayout()
-        mh.addWidget(QLabel("LIVE ATTACK MAP"))
-        self.btn_refresh_map = QPushButton("REFRESH MAP"); self.btn_refresh_map.setFixedWidth(130)
+        mv = QVBoxLayout(self.map_card)
+        mv.setContentsMargins(8, 6, 8, 6)
+        mv.setSpacing(4)
+        mh = QHBoxLayout()
+        lbl_map = QLabel("LIVE ATTACK MAP")
+        lbl_map.setStyleSheet("font-size: 10px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
+        self.btn_refresh_map = QPushButton("REFRESH MAP"); self.btn_refresh_map.setFixedWidth(110)
         self.btn_refresh_map.clicked.connect(self.update_world_map)
-        mh.addStretch(); mh.addWidget(self.btn_refresh_map); mv.addLayout(mh)
-        self.web_view = QWebEngineView(); self.web_view.setFixedHeight(300)
-        mv.addWidget(self.web_view); left.addWidget(self.map_card, 1)
+        mh.addWidget(lbl_map); mh.addStretch(); mh.addWidget(self.btn_refresh_map)
+        mv.addLayout(mh)
+        self.web_view = QWebEngineView()
+        self.web_view.setFixedHeight(map_h)
+        mv.addWidget(self.web_view)
+        left.addWidget(self.map_card)
+
+        # ── Right panel: risk + search + table + details ──────────────────────
         right_widget = QWidget(); right = QVBoxLayout(right_widget)
+        right.setContentsMargins(4, 0, 0, 0)
+        right.setSpacing(4)
+
         self.risk_card = QFrame(); self.risk_card.setObjectName("Card")
-        rv = QVBoxLayout(self.risk_card); rv.addWidget(QLabel("CURRENT RISK LEVEL"))
+        self.risk_card.setFixedHeight(72)
+        rv = QHBoxLayout(self.risk_card)
+        rv.setContentsMargins(16, 4, 16, 4)
+        lbl_risk_title = QLabel("CURRENT RISK LEVEL")
+        lbl_risk_title.setStyleSheet("font-size: 10px; color: #888; letter-spacing: 1px;")
         self.lbl_risk = QLabel("NORMAL")
-        self.lbl_risk.setStyleSheet("font-size: 35px; color: #00ff88; font-weight: bold;")
-        rv.addWidget(self.lbl_risk, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.lbl_risk.setStyleSheet("font-size: 26px; color: #00ff88; font-weight: bold;")
+        rv.addWidget(lbl_risk_title)
+        rv.addStretch()
+        rv.addWidget(self.lbl_risk)
         right.addWidget(self.risk_card)
+
         tools = QHBoxLayout()
+        tools.setSpacing(6)
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Search by IP, country, event, severity, threat...")
         self.search_bar.textChanged.connect(self.filter_table)
-        btn_zoom_out = QPushButton("-")
-        btn_zoom_in = QPushButton("+")
-        btn_zoom_out.setFixedWidth(34); btn_zoom_in.setFixedWidth(34)
+        btn_zoom_out = QPushButton("−"); btn_zoom_out.setFixedWidth(30)
+        btn_zoom_in  = QPushButton("+"); btn_zoom_in.setFixedWidth(30)
         btn_zoom_out.clicked.connect(lambda: self._set_zoom(self.gui_zoom - 1))
         btn_zoom_in.clicked.connect(lambda: self._set_zoom(self.gui_zoom + 1))
         tools.addWidget(self.search_bar)
         tools.addWidget(btn_zoom_out)
         tools.addWidget(btn_zoom_in)
         right.addLayout(tools)
+
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(["Timestamp","Source IP","Country","Type","Severity","Threat Score","Status"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_status_menu)
         self.table.itemSelectionChanged.connect(self._show_selected_alert_details)
-        right.addWidget(self.table, 3)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        right.addWidget(self.table, 1)
+
         self.details_card = QFrame(); self.details_card.setObjectName("Card")
         dv = QVBoxLayout(self.details_card)
-        dv.addWidget(QLabel("FULL INCIDENT DETAILS"))
+        dv.setContentsMargins(8, 6, 8, 6)
+        dv.setSpacing(4)
+        lbl_det = QLabel("FULL INCIDENT REPORT")
+        lbl_det.setStyleSheet("font-size: 10px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
+        dv.addWidget(lbl_det)
         self.detail_text = QTextEdit()
         self.detail_text.setReadOnly(True)
-        self.detail_text.setMinimumHeight(150)
-        self.detail_text.setStyleSheet("background-color:#101028; color:#ffffff; border:1px solid #2e2e66;")
+        self.detail_text.setFixedHeight(details_h)
+        self.detail_text.setStyleSheet(
+            "background-color:#0a0a1e; color:#ffffff; border:1px solid #2e2e66;"
+            "font-family:'Consolas'; font-size:11px;"
+        )
         dv.addWidget(self.detail_text)
-        right.addWidget(self.details_card, 1)
+        right.addWidget(self.details_card)
+
         self.alert_splitter.addWidget(left_widget)
         self.alert_splitter.addWidget(right_widget)
         self.alert_splitter.setSizes(self.alert_split_sizes)
@@ -340,63 +702,72 @@ class SOCDashboard(QMainWindow):
         self.tabs.addTab(tab, "🔴 Live Alerts")
 
     def _build_tab_stats(self):
-        tab = QWidget(); tl = QVBoxLayout(tab); tl.setSpacing(8)
+        sh = _screen_h()
+        chart_h = max(200, int(sh * 0.24))   # ~259px on 1080p
+        heat_h  = max(150, int(sh * 0.17))   # ~183px on 1080p
+        tbl_h   = max(110, int(sh * 0.12))   # ~129px on 1080p
 
-        # ── Top row: Pie chart + Severity bar ──
-        top_row = QHBoxLayout(); top_row.setSpacing(8)
+        tab = QWidget(); tl = QVBoxLayout(tab)
+        tl.setContentsMargins(4, 4, 4, 4)
+        tl.setSpacing(6)
 
-        # Pie chart card
+        # ── Top row: pie + severity bar ───────────────────────────────────────
+        top_row = QHBoxLayout(); top_row.setSpacing(6)
+
         pie_card = QFrame(); pie_card.setObjectName("Card")
         pie_vl = QVBoxLayout(pie_card)
+        pie_vl.setContentsMargins(8, 6, 8, 6)
         pie_title = QLabel("EVENT TYPE DISTRIBUTION")
-        pie_title.setStyleSheet("color:#00f2ff; font-size:11px; font-weight:bold; letter-spacing:2px;")
+        pie_title.setStyleSheet("color:#00f2ff; font-size:10px; font-weight:bold; letter-spacing:2px;")
         pie_vl.addWidget(pie_title)
         self.pie_widget = pg.PlotWidget()
         self.pie_widget.setBackground("#161633")
-        self.pie_widget.setFixedHeight(280)
+        self.pie_widget.setFixedHeight(chart_h)
         self.pie_widget.hideAxis("left"); self.pie_widget.hideAxis("bottom")
         self.pie_widget.setAspectLocked(True)
         pie_vl.addWidget(self.pie_widget)
         top_row.addWidget(pie_card, 3)
 
-        # Severity bar chart card
         sev_card = QFrame(); sev_card.setObjectName("Card")
         sev_vl = QVBoxLayout(sev_card)
+        sev_vl.setContentsMargins(8, 6, 8, 6)
         sev_title = QLabel("SEVERITY BREAKDOWN")
-        sev_title.setStyleSheet("color:#00f2ff; font-size:11px; font-weight:bold; letter-spacing:2px;")
+        sev_title.setStyleSheet("color:#00f2ff; font-size:10px; font-weight:bold; letter-spacing:2px;")
         sev_vl.addWidget(sev_title)
         self.sev_widget = pg.PlotWidget()
         self.sev_widget.setBackground("#161633")
-        self.sev_widget.setFixedHeight(280)
+        self.sev_widget.setFixedHeight(chart_h)
         self.sev_widget.showGrid(y=True, alpha=0.3)
         sev_vl.addWidget(self.sev_widget)
         top_row.addWidget(sev_card, 2)
         tl.addLayout(top_row)
 
-        # ── Heatmap card ──
+        # ── Heatmap ───────────────────────────────────────────────────────────
         heat_card = QFrame(); heat_card.setObjectName("Card")
         heat_vl = QVBoxLayout(heat_card)
-        heat_title = QLabel("ATTACK HEATMAP — DAY x HOUR")
-        heat_title.setStyleSheet("color:#00f2ff; font-size:11px; font-weight:bold; letter-spacing:2px;")
+        heat_vl.setContentsMargins(8, 6, 8, 6)
+        heat_title = QLabel("ATTACK HEATMAP — DAY × HOUR")
+        heat_title.setStyleSheet("color:#00f2ff; font-size:10px; font-weight:bold; letter-spacing:2px;")
         heat_vl.addWidget(heat_title)
         self.heat_widget = pg.PlotWidget()
         self.heat_widget.setBackground("#161633")
-        self.heat_widget.setFixedHeight(200)
-        self.heat_widget.setLabel("left", "Day", color="#00f2ff")
-        self.heat_widget.setLabel("bottom", "Hour (0-23)", color="#00f2ff")
+        self.heat_widget.setFixedHeight(heat_h)
+        self.heat_widget.setLabel("left",   "Day",          color="#00f2ff")
+        self.heat_widget.setLabel("bottom", "Hour (0–23)",  color="#00f2ff")
         heat_vl.addWidget(self.heat_widget)
         tl.addWidget(heat_card)
 
-        # ── Bottom: event breakdown table ──
+        # ── Event breakdown table ─────────────────────────────────────────────
         tbl_card = QFrame(); tbl_card.setObjectName("Card")
         tbl_vl = QVBoxLayout(tbl_card)
+        tbl_vl.setContentsMargins(8, 6, 8, 6)
         tbl_lbl = QLabel("DETAILED EVENT BREAKDOWN")
-        tbl_lbl.setStyleSheet("color:#00f2ff; font-size:11px; font-weight:bold; letter-spacing:2px;")
+        tbl_lbl.setStyleSheet("color:#00f2ff; font-size:10px; font-weight:bold; letter-spacing:2px;")
         tbl_vl.addWidget(tbl_lbl)
         self.stats_table = QTableWidget(0, 3)
         self.stats_table.setHorizontalHeaderLabels(["Event Type", "Count", "% of Total"])
         self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.stats_table.setFixedHeight(160)
+        self.stats_table.setFixedHeight(tbl_h)
         tbl_vl.addWidget(self.stats_table)
         tl.addWidget(tbl_card)
 
@@ -404,87 +775,307 @@ class SOCDashboard(QMainWindow):
 
     def _build_tab_timeline(self):
         tab = QWidget(); tl = QVBoxLayout(tab)
-        tl.addWidget(QLabel("INCIDENTS PER HOUR (LAST 24H)"))
+        tl.setContentsMargins(4, 4, 4, 4)
+        lbl = QLabel("INCIDENTS PER HOUR (LAST 24H)")
+        lbl.setStyleSheet("font-size: 10px; color: #00f2ff; font-weight: bold; letter-spacing: 2px;")
+        tl.addWidget(lbl)
         self.timeline_widget = pg.PlotWidget(); self.timeline_widget.setBackground("#161633")
-        self.timeline_widget.setLabel("left", "Count", color="#00f2ff")
-        self.timeline_widget.setLabel("bottom", "Hour", color="#00f2ff")
+        self.timeline_widget.setLabel("left",   "Count", color="#00f2ff")
+        self.timeline_widget.setLabel("bottom", "Hour",  color="#00f2ff")
         self.timeline_widget.showGrid(x=True, y=True, alpha=0.3)
         tl.addWidget(self.timeline_widget)
         self.tabs.addTab(tab, "📈 Timeline")
 
     def _build_tab_threat(self):
         tab = QWidget(); tl = QVBoxLayout(tab)
-        tl.addWidget(QLabel("THREAT INTELLIGENCE — AbuseIPDB + AI Analysis"))
+        tl.setContentsMargins(4, 4, 4, 4)
+        lbl = QLabel("THREAT INTELLIGENCE — AbuseIPDB + AI Analysis")
+        lbl.setStyleSheet("font-size: 10px; color: #00f2ff; font-weight: bold; letter-spacing: 2px;")
+        tl.addWidget(lbl)
         self.threat_table = QTableWidget(0, 8)
         self.threat_table.setHorizontalHeaderLabels(["IP","Combined","AI","AbuseIPDB","Risk Level","Country","ISP","AI Summary"])
         self.threat_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         tl.addWidget(self.threat_table)
         self.tabs.addTab(tab, "🌐 Threat Intel")
 
+    def _build_tab_reports(self):
+        tab = QWidget(); tl = QVBoxLayout(tab)
+        tl.setContentsMargins(4, 4, 4, 4)
+        tl.setSpacing(4)
+
+        # ── Top bar ───────────────────────────────────────────────────────────
+        top = QHBoxLayout()
+        lbl = QLabel("AI INCIDENT REPORTS  —  deepseek-coder-v2:16b via Ollama")
+        lbl.setStyleSheet("font-size: 11px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
+        self.lbl_report_status = QLabel("")
+        self.lbl_report_status.setStyleSheet("font-size: 10px; color: #6c5ce7; font-family: 'Courier New';")
+        top.addWidget(lbl)
+        top.addWidget(self.lbl_report_status)
+        top.addStretch()
+        tl.addLayout(top)
+
+        # ── Report list table (top half) ──────────────────────────────────────
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        list_frame = QFrame(); list_frame.setObjectName("Card")
+        lf = QVBoxLayout(list_frame)
+        lf.setContentsMargins(6, 6, 6, 6)
+        self.reports_table = QTableWidget(0, 7)
+        self.reports_table.setHorizontalHeaderLabels([
+            "Report #", "Incident", "Time", "Event Type", "Source IP", "Severity", "Confidence"
+        ])
+        self.reports_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.reports_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.reports_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.reports_table.itemSelectionChanged.connect(self._show_report_detail)
+        lf.addWidget(self.reports_table)
+        splitter.addWidget(list_frame)
+
+        # ── Detail panel (bottom half) ────────────────────────────────────────
+        detail_frame = QFrame(); detail_frame.setObjectName("Card")
+        df = QVBoxLayout(detail_frame)
+        df.setContentsMargins(10, 8, 10, 8)
+        df.setSpacing(6)
+
+        detail_header = QHBoxLayout()
+        self.lbl_report_title = QLabel("Select a report above to view full analysis")
+        self.lbl_report_title.setStyleSheet("font-size: 12px; color: #00f2ff; font-weight: bold;")
+        self.lbl_report_confidence = QLabel("")
+        self.lbl_report_confidence.setStyleSheet("font-size: 11px; color: #ffa502; font-weight: bold;")
+        detail_header.addWidget(self.lbl_report_title)
+        detail_header.addStretch()
+        detail_header.addWidget(self.lbl_report_confidence)
+        df.addLayout(detail_header)
+
+        # Two-column detail layout
+        cols = QHBoxLayout(); cols.setSpacing(8)
+
+        # Left column: summary + MITRE
+        left_col = QVBoxLayout()
+        lbl_sum = QLabel("ATTACK SUMMARY")
+        lbl_sum.setStyleSheet("font-size: 9px; color: #888; letter-spacing: 1px;")
+        self.report_summary = QTextEdit()
+        self.report_summary.setReadOnly(True)
+        self.report_summary.setFixedHeight(80)
+        self.report_summary.setStyleSheet("background:#101028; color:#ffffff; border:1px solid #2e2e66; font-size:11px;")
+
+        lbl_mitre = QLabel("MITRE ATT&CK")
+        lbl_mitre.setStyleSheet("font-size: 9px; color: #888; letter-spacing: 1px; margin-top: 4px;")
+        self.report_mitre = QTextEdit()
+        self.report_mitre.setReadOnly(True)
+        self.report_mitre.setFixedHeight(70)
+        self.report_mitre.setStyleSheet("background:#101028; color:#a29bfe; border:1px solid #2e2e66; font-size:11px;")
+
+        left_col.addWidget(lbl_sum)
+        left_col.addWidget(self.report_summary)
+        left_col.addWidget(lbl_mitre)
+        left_col.addWidget(self.report_mitre)
+        cols.addLayout(left_col, 3)
+
+        # Right column: IOCs + actions
+        right_col = QVBoxLayout()
+        lbl_iocs = QLabel("IOCs")
+        lbl_iocs.setStyleSheet("font-size: 9px; color: #888; letter-spacing: 1px;")
+        self.report_iocs = QTextEdit()
+        self.report_iocs.setReadOnly(True)
+        self.report_iocs.setFixedHeight(60)
+        self.report_iocs.setStyleSheet("background:#101028; color:#ff4757; border:1px solid #2e2e66; font-size:11px;")
+
+        lbl_actions = QLabel("RECOMMENDED ACTIONS")
+        lbl_actions.setStyleSheet("font-size: 9px; color: #888; letter-spacing: 1px; margin-top: 4px;")
+        self.report_actions = QTextEdit()
+        self.report_actions.setReadOnly(True)
+        self.report_actions.setFixedHeight(90)
+        self.report_actions.setStyleSheet("background:#101028; color:#00ff88; border:1px solid #2e2e66; font-size:11px;")
+
+        right_col.addWidget(lbl_iocs)
+        right_col.addWidget(self.report_iocs)
+        right_col.addWidget(lbl_actions)
+        right_col.addWidget(self.report_actions)
+        cols.addLayout(right_col, 2)
+
+        df.addLayout(cols)
+        splitter.addWidget(detail_frame)
+
+        sh = _screen_h()
+        splitter.setSizes([int(sh * 0.28), int(sh * 0.30)])
+        tl.addWidget(splitter, 1)
+        self.tabs.addTab(tab, "🤖 AI Reports")
+
+        # Store reports data for selection lookup
+        self._reports_data = []
+
+    def _refresh_reports_tab(self):
+        if not self.db_path:
+            return
+        try:
+            reports = get_recent_reports(self.db_path, limit=50)
+            self._reports_data = reports
+            self.reports_table.clearContents()
+            self.reports_table.setRowCount(len(reports))
+
+            conf_colors = {
+                range(0,  40):  "#888888",
+                range(40, 70):  "#ffa502",
+                range(70, 90):  "#00b894",
+                range(90, 101): "#00f2ff",
+            }
+
+            def conf_color(c):
+                for r, col in conf_colors.items():
+                    if c in r:
+                        return col
+                return "#ffffff"
+
+            sev_col = {"CRITICAL": "#ff0000", "HIGH": "#ff4757", "MEDIUM": "#ffa502", "LOW": "#00ff88"}
+
+            for i, r in enumerate(reports):
+                conf = int(r.get("confidence", 0))
+                sev  = str(r.get("severity", "LOW")).upper()
+                cc   = conf_color(conf)
+                sc   = sev_col.get(sev, "#ffffff")
+                cells = [
+                    (str(r.get("id", "")),            cc),
+                    (str(r.get("incident_id", "")),   cc),
+                    (str(r.get("generated_at", ""))[:19], "#aaaaaa"),
+                    (str(r.get("event_type", "")),    sc),
+                    (str(r.get("source_ip", "")),     "#74b9ff"),
+                    (sev,                             sc),
+                    (f"{conf}%",                      cc),
+                ]
+                for j, (val, color) in enumerate(cells):
+                    item = QTableWidgetItem(val)
+                    item.setForeground(QColor(color))
+                    self.reports_table.setItem(i, j, item)
+
+            count = len(reports)
+            self.lbl_report_status.setText(f"{count} report{'s' if count != 1 else ''} available")
+        except Exception as e:
+            print(f"[REPORTS TAB ERROR] {e}")
+
+    def _show_report_detail(self):
+        row = self.reports_table.currentRow()
+        if row < 0 or row >= len(self._reports_data):
+            return
+        r = self._reports_data[row]
+
+        sev = str(r.get("severity", "")).upper()
+        sev_col = {"CRITICAL": "#ff0000", "HIGH": "#ff4757", "MEDIUM": "#ffa502", "LOW": "#00ff88"}
+        color = sev_col.get(sev, "#ffffff")
+
+        self.lbl_report_title.setText(
+            f"Report #{r.get('id')}  |  {r.get('event_type', '')}  from  {r.get('source_ip', '')}"
+        )
+        self.lbl_report_title.setStyleSheet(f"font-size: 12px; color: {color}; font-weight: bold;")
+
+        conf = int(r.get("confidence", 0))
+        self.lbl_report_confidence.setText(f"Confidence: {conf}%  |  Model: {r.get('model', '')}")
+
+        self.report_summary.setPlainText(r.get("attack_summary", "") or "No summary available.")
+
+        mitre_text = ""
+        if r.get("mitre_tactics"):
+            mitre_text += f"Tactics:    {r['mitre_tactics']}\n"
+        if r.get("mitre_techniques"):
+            mitre_text += f"Techniques: {r['mitre_techniques']}"
+        self.report_mitre.setPlainText(mitre_text.strip() or "No MITRE data.")
+
+        self.report_iocs.setPlainText(r.get("iocs", "") or "No IOCs extracted.")
+
+        actions = r.get("recommended_actions", "") or ""
+        formatted = "\n".join(
+            f"• {a.strip()}" for a in actions.split(";") if a.strip()
+        )
+        self.report_actions.setPlainText(formatted or "No actions available.")
+
     def _build_tab_blocklist(self):
         tab = QWidget(); tl = QVBoxLayout(tab)
-        # Manual block controls
-        ctrl = QHBoxLayout()
-        self.inp_block_ip     = QLineEdit(); self.inp_block_ip.setPlaceholderText("IP to block (e.g. 1.2.3.4)")
-        self.inp_block_reason = QLineEdit(); self.inp_block_reason.setPlaceholderText("Reason (optional)")
-        btn_block   = QPushButton("BLOCK IP");   btn_block.setObjectName("danger")
-        btn_unblock = QPushButton("UNBLOCK SELECTED"); btn_unblock.setStyleSheet("background-color:#2e2e66;")
-        btn_refresh = QPushButton("REFRESH")
+        tl.setContentsMargins(4, 4, 4, 4)
+        tl.setSpacing(4)
+
+        ctrl = QHBoxLayout(); ctrl.setSpacing(6)
+        self.inp_block_ip     = QLineEdit()
+        self.inp_block_ip.setPlaceholderText("IP address to block  (e.g. 203.0.113.5)")
+        self.inp_block_reason = QLineEdit()
+        self.inp_block_reason.setPlaceholderText("Reason (optional)")
+        self.lbl_block_err = QLabel("")
+        self.lbl_block_err.setStyleSheet("color:#ff4757; font-size:10px;")
+        btn_block   = QPushButton("BLOCK IP");          btn_block.setObjectName("danger");    btn_block.setFixedWidth(100)
+        btn_unblock = QPushButton("UNBLOCK SELECTED");  btn_unblock.setStyleSheet("background:#2e2e66;"); btn_unblock.setFixedWidth(160)
         btn_block.clicked.connect(self._manual_block)
         btn_unblock.clicked.connect(self._manual_unblock)
-        btn_refresh.clicked.connect(self._refresh_blocklist_tab)
-        ctrl.addWidget(self.inp_block_ip); ctrl.addWidget(self.inp_block_reason)
-        ctrl.addWidget(btn_block); ctrl.addWidget(btn_unblock); ctrl.addWidget(btn_refresh)
+        ctrl.addWidget(self.inp_block_ip, 2)
+        ctrl.addWidget(self.inp_block_reason, 3)
+        ctrl.addWidget(self.lbl_block_err, 2)
+        ctrl.addStretch()
+        ctrl.addWidget(btn_block)
+        ctrl.addWidget(btn_unblock)
         tl.addLayout(ctrl)
-        self.blocklist_table = QTableWidget(0, 4)
-        self.blocklist_table.setHorizontalHeaderLabels(["IP","Reason","Added At","Select"])
+
+        self.blocklist_table = QTableWidget(0, 3)
+        self.blocklist_table.setHorizontalHeaderLabels(["IP Address", "Reason", "Added At"])
         self.blocklist_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.blocklist_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.blocklist_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.blocklist_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.blocklist_table.setAlternatingRowColors(True)
+        self.blocklist_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         tl.addWidget(self.blocklist_table)
+
+        hint = QLabel("Click a row to select · Shift+Click or Ctrl+Click for multiple · then press UNBLOCK SELECTED")
+        hint.setStyleSheet("color:#444; font-size:10px;")
+        tl.addWidget(hint)
         self.tabs.addTab(tab, "🚫 Blocklist")
 
     def _build_tab_rules(self):
         tab = QWidget(); tl = QVBoxLayout(tab)
-        tl.addWidget(QLabel("CUSTOM RULE ENGINE — Auto-Block & Email Rules"))
+        tl.setContentsMargins(4, 4, 4, 4)
+        tl.setSpacing(4)
 
-        # Add rule form
-        form_frame = QFrame(); form_frame.setObjectName("Card")
-        ff = QHBoxLayout(form_frame)
-        self.inp_rule_name  = QLineEdit(); self.inp_rule_name.setPlaceholderText("Rule name")
-        self.inp_rule_cond  = QLineEdit(); self.inp_rule_cond.setPlaceholderText("Condition (e.g. bruteforce, ddos, threat_score)")
-        self.inp_rule_thr   = QSpinBox();  self.inp_rule_thr.setRange(1, 9999); self.inp_rule_thr.setValue(5)
-        self.inp_rule_win   = QSpinBox();  self.inp_rule_win.setRange(0, 3600); self.inp_rule_win.setValue(60); self.inp_rule_win.setSuffix("s")
-        self.cmb_rule_act   = QComboBox(); self.cmb_rule_act.addItems(["block", "email"])
-        btn_add = QPushButton("ADD RULE"); btn_add.setObjectName("success")
-        btn_add.clicked.connect(self._add_rule)
-        ff.addWidget(QLabel("Name:")); ff.addWidget(self.inp_rule_name)
-        ff.addWidget(QLabel("Condition:")); ff.addWidget(self.inp_rule_cond)
-        ff.addWidget(QLabel("Threshold:")); ff.addWidget(self.inp_rule_thr)
-        ff.addWidget(QLabel("Window:")); ff.addWidget(self.inp_rule_win)
-        ff.addWidget(QLabel("Action:")); ff.addWidget(self.cmb_rule_act)
-        ff.addWidget(btn_add)
-        tl.addWidget(form_frame)
+        top = QHBoxLayout()
+        lbl = QLabel("RULE ENGINE v2 — Multi-condition · Multi-action · Priority · Cooldown")
+        lbl.setStyleSheet("font-size: 11px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
+        btn_new = QPushButton("＋ NEW RULE"); btn_new.setObjectName("success"); btn_new.setFixedWidth(120)
+        btn_new.clicked.connect(self._new_rule)
+        top.addWidget(lbl); top.addStretch(); top.addWidget(btn_new)
+        tl.addLayout(top)
 
-        self.rules_table = QTableWidget(0, 7)
-        self.rules_table.setHorizontalHeaderLabels(["ID","Name","Condition","Threshold","Window","Action","Enabled"])
-        self.rules_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        tl.addWidget(self.rules_table)
+        self.rules_table = QTableWidget(0, 8)
+        self.rules_table.setHorizontalHeaderLabels(
+            ["Pri", "Name", "Conditions", "Thr/Win", "Actions", "Cooldown", "On", ""]
+        )
+        hh = self.rules_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        self.rules_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.rules_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.rules_table.cellDoubleClicked.connect(self._edit_rule_row)
+        tl.addWidget(self.rules_table, 1)
 
         btn_row = QHBoxLayout()
-        btn_del    = QPushButton("DELETE SELECTED"); btn_del.setObjectName("danger")
-        btn_reload = QPushButton("REFRESH RULES")
+        btn_del  = QPushButton("DELETE SELECTED"); btn_del.setObjectName("danger"); btn_del.setFixedWidth(160)
+        btn_edit = QPushButton("EDIT SELECTED");   btn_edit.setStyleSheet("background:#2e2e66;"); btn_edit.setFixedWidth(140)
         btn_del.clicked.connect(self._delete_rule)
-        btn_reload.clicked.connect(self._refresh_rules_tab)
-        btn_row.addWidget(btn_del); btn_row.addWidget(btn_reload); btn_row.addStretch()
+        btn_edit.clicked.connect(lambda: self._edit_rule_row(self.rules_table.currentRow(), 0))
+        btn_row.addWidget(btn_edit); btn_row.addWidget(btn_del); btn_row.addStretch()
         tl.addLayout(btn_row)
         self.tabs.addTab(tab, "⚙️ Rule Engine")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _make_stat_card(self, title, value, color):
-        card = QFrame(); card.setObjectName("Card"); card.setFixedSize(160, 80)
+        card = QFrame(); card.setObjectName("Card"); card.setFixedSize(148, 72)
         vl = QVBoxLayout(card)
-        lbl_t = QLabel(title); lbl_t.setStyleSheet(f"font-size: 10px; color: {color};"); lbl_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_v = QLabel(value); lbl_v.setStyleSheet(f"font-size: 26px; font-weight: bold; color: {color};"); lbl_v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vl.setContentsMargins(4, 4, 4, 4)
+        vl.setSpacing(2)
+        lbl_t = QLabel(title); lbl_t.setStyleSheet(f"font-size: 9px; color: {color};"); lbl_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_v = QLabel(value); lbl_v.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {color};"); lbl_v.setAlignment(Qt.AlignmentFlag.AlignCenter)
         vl.addWidget(lbl_t); vl.addWidget(lbl_v)
         return card, lbl_v
 
@@ -499,7 +1090,7 @@ class SOCDashboard(QMainWindow):
             widget = getattr(self, widget_name, None)
             if widget:
                 widget.setFont(font)
-                widget.verticalHeader().setDefaultSectionSize(max(24, self.gui_zoom + 16))
+                widget.verticalHeader().setDefaultSectionSize(max(22, self.gui_zoom + 12))
         if hasattr(self, "detail_text"):
             self.detail_text.setFont(QFont("Consolas", self.gui_zoom))
 
@@ -507,31 +1098,169 @@ class SOCDashboard(QMainWindow):
         row = self.table.currentRow() if hasattr(self, "table") else -1
         if row < 0 or not hasattr(self, "detail_text"):
             return
-        id_item = self.table.item(row, 0)
+        id_item  = self.table.item(row, 0)
         alert_id = id_item.data(Qt.ItemDataRole.UserRole) if id_item else None
-        alert = next((a for a in self._all_alerts if a.get("id") == alert_id), None)
+        alert    = next((a for a in self._all_alerts if a.get("id") == alert_id), None)
         if not alert:
             return
-        ip = str(alert.get("source_ip", ""))
+
+        ip  = str(alert.get("source_ip", ""))
+        sev = str(alert.get("severity", "LOW")).upper()
         with self._threat_lock:
             threat = self._threat_cache.get(ip, {})
-        combined = max(int(alert.get("threat_score") or 0), int(alert.get("ai_score") or 0), int(threat.get("abuse_score") or 0))
-        lines = [
-            f"ID: {alert.get('id')}",
-            f"Time: {alert.get('timestamp')}",
-            f"Source IP: {ip}",
-            f"Event: {alert.get('event_type')} | Severity: {alert.get('severity')} | Category: {alert.get('category')}",
-            f"Status: {alert.get('status')}",
-            f"Combined Threat Score: {combined}",
-            f"AI Score: {alert.get('ai_score', 0)} | AbuseIPDB: {threat.get('abuse_score', 'unknown')} | Anomaly: {alert.get('anomaly_score', 0)}",
-            "",
-            "AI Summary:",
-            str(alert.get("ai_summary") or "No AI summary stored for this incident."),
-            "",
-            "Raw Log:",
-            str(alert.get("raw_log") or "Raw log was not stored for this older incident."),
-        ]
-        self.detail_text.setPlainText("\n".join(lines))
+        combined = max(
+            int(alert.get("threat_score") or 0),
+            int(alert.get("ai_score") or 0),
+            int(threat.get("abuse_score") or 0),
+        )
+
+        sev_colors = {"CRITICAL": "#ff0000", "HIGH": "#ff4757", "MEDIUM": "#ffa502", "LOW": "#00ff88"}
+        sev_bg     = {"CRITICAL": "#2e0000", "HIGH": "#2e1000", "MEDIUM": "#2e1e00", "LOW": "#002e10"}
+        sc  = sev_colors.get(sev, "#ffffff")
+        sbg = sev_bg.get(sev, "#1a1a2e")
+
+        def e(s):
+            return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+        def badge(text, color, bg):
+            return (f'<span style="background:{bg};color:{color};padding:2px 8px;'
+                    f'border-radius:4px;font-weight:bold;">{e(text)}</span>')
+
+        def section(title, content_html, title_color="#00f2ff"):
+            return (f'<div style="color:{title_color};font-size:10px;letter-spacing:1px;'
+                    f'margin:6px 0 2px 0;">▶ {title}</div>'
+                    f'<div style="padding-left:8px;margin-bottom:4px;">{content_html}</div>')
+
+        # ── Fetch deepseek report ─────────────────────────────────────────────
+        report = None
+        if self.db_path and alert_id:
+            try:
+                from core.ollama_reporter import get_report
+                report = get_report(self.db_path, alert_id)
+            except Exception:
+                pass
+
+        # ── Build HTML ────────────────────────────────────────────────────────
+        html = ['<div style="background:#0a0a1e;color:#fff;font-family:Consolas,monospace;font-size:11px;padding:6px;">']
+
+        # Header strip
+        status_color = {"Blocked":"#ff4757","Logged":"#74b9ff","Investigating":"#ffa502",
+                        "Resolved":"#00ff88","Quarantined":"#fd79a8"}.get(alert.get("status","Logged"), "#aaa")
+        html.append(
+            f'<table width="100%" cellspacing="0" cellpadding="2" '
+            f'style="border-bottom:1px solid #2e2e66;margin-bottom:6px;"><tr>'
+            f'<td><span style="color:#888;font-size:10px;">ID&nbsp;</span>'
+            f'<span style="color:#fff;font-weight:bold;">#{e(alert.get("id",""))}</span></td>'
+            f'<td><span style="color:#888;font-size:10px;">TIME&nbsp;</span>'
+            f'<span style="color:#aaa;">{e(str(alert.get("timestamp",""))[:19])}</span></td>'
+            f'<td><span style="color:#888;font-size:10px;">FROM&nbsp;</span>'
+            f'<span style="color:#74b9ff;font-weight:bold;">{e(ip)}</span></td>'
+            f'<td align="right"><span style="color:{status_color};font-weight:bold;">'
+            f'{e(alert.get("status",""))}</span></td>'
+            f'</tr></table>'
+        )
+
+        # Event + severity badges + scores
+        html.append(
+            f'<div style="margin-bottom:8px;">'
+            f'{badge(alert.get("event_type",""), sc, sbg)}&nbsp;&nbsp;'
+            f'{badge(sev, sc, sbg)}&nbsp;&nbsp;'
+            f'<span style="color:#888;font-size:10px;">Threat&nbsp;<b style="color:{sc};">{combined}</b>/100&nbsp;&nbsp;'
+            f'AI&nbsp;<b style="color:#a29bfe;">{alert.get("ai_score",0)}</b>&nbsp;&nbsp;'
+            f'VT&nbsp;<b style="color:#fd79a8;">{alert.get("vt_score",0)}</b>&nbsp;&nbsp;'
+            f'Behavior&nbsp;<b style="color:#ffa502;">{alert.get("behavior_score",0)}</b></span>'
+            f'</div>'
+        )
+
+        # ── DeepSeek report block ─────────────────────────────────────────────
+        if report:
+            conf      = int(report.get("confidence") or 0)
+            conf_col  = "#00f2ff" if conf >= 80 else "#ffa502" if conf >= 50 else "#888"
+            model_lbl = f'<span style="color:#555;font-size:10px;">{e(report.get("model",""))}&nbsp;·&nbsp;confidence&nbsp;<b style="color:{conf_col};">{conf}%</b></span>'
+
+            summary_html = (
+                f'<div style="background:#0d0d28;border-left:3px solid #6c5ce7;'
+                f'padding:5px 8px;color:#e0e0e0;line-height:1.5;">'
+                f'{e(report.get("attack_summary","No summary."))}</div>'
+            )
+            html.append(section(f"AI ANALYSIS  {model_lbl}", summary_html))
+
+            if report.get("mitre_tactics") or report.get("mitre_techniques"):
+                mitre_html = ""
+                if report.get("mitre_tactics"):
+                    tactics = " &nbsp;·&nbsp; ".join(
+                        f'<span style="background:#1a1040;color:#a29bfe;padding:1px 6px;border-radius:3px;">{e(t.strip())}</span>'
+                        for t in report["mitre_tactics"].split(";") if t.strip()
+                    )
+                    mitre_html += f'<div style="margin-bottom:3px;"><span style="color:#666;font-size:10px;">Tactics&nbsp;</span>{tactics}</div>'
+                if report.get("mitre_techniques"):
+                    techs = "<br>".join(
+                        f'<span style="color:#a29bfe;">• {e(t.strip())}</span>'
+                        for t in report["mitre_techniques"].split(";") if t.strip()
+                    )
+                    mitre_html += f'<div>{techs}</div>'
+                html.append(section("MITRE ATT&amp;CK", mitre_html))
+
+            # IOCs + Actions side by side
+            ioc_items = [e(i.strip()) for i in (report.get("iocs") or "").split(";") if i.strip()]
+            ioc_html  = "<br>".join(
+                f'<span style="color:#ff4757;">⚑ {i}</span>' for i in ioc_items
+            ) or '<span style="color:#555;">None identified</span>'
+
+            action_items = [e(a.strip()) for a in (report.get("recommended_actions") or "").split(";") if a.strip()]
+            act_html = "<br>".join(
+                f'<span style="color:#00ff88;">• {a}</span>' for a in action_items
+            ) or '<span style="color:#555;">No actions</span>'
+
+            html.append(
+                f'<table width="100%" cellspacing="0" cellpadding="0"><tr valign="top">'
+                f'<td width="38%">{section("IOCs", ioc_html)}</td>'
+                f'<td width="4px"></td>'
+                f'<td>{section("RECOMMENDED ACTIONS", act_html)}</td>'
+                f'</tr></table>'
+            )
+
+        else:
+            # Heuristic summary while deepseek is generating
+            heuristic = e(alert.get("ai_summary") or "No heuristic summary available.")
+            html.append(section(
+                "HEURISTIC ANALYSIS",
+                f'<div style="background:#0d0d28;border-left:3px solid #2e2e66;'
+                f'padding:5px 8px;color:#aaa;">{heuristic}</div>'
+            ))
+
+            beh = alert.get("behavior_alerts", "")
+            if beh:
+                beh_items = "<br>".join(
+                    f'<span style="color:#ffa502;">⚡ {e(b.strip())}</span>'
+                    for b in beh.split(";") if b.strip()
+                )
+                html.append(section("BEHAVIORAL ALERTS", beh_items))
+
+            html.append(
+                f'<div style="color:#555;font-size:10px;font-style:italic;margin-top:4px;">'
+                f'⏳ AI report generating via deepseek-coder-v2:16b — updates automatically in ~30–60s</div>'
+            )
+
+        # VT hash
+        if alert.get("vt_hash"):
+            vt_html = (
+                f'<span style="color:#fd79a8;">{e(alert["vt_hash"])}</span>'
+                + (f'&nbsp;&nbsp;<a href="{e(alert.get("vt_link",""))}" style="color:#6c5ce7;">View on VirusTotal ↗</a>'
+                   if alert.get("vt_link") else "")
+            )
+            html.append(section("VIRUSTOTAL HASH", vt_html))
+
+        # Raw log — always at the bottom
+        raw = e(str(alert.get("raw_log") or "Raw log not stored for this incident."))
+        html.append(
+            f'<div style="color:#00f2ff;font-size:10px;letter-spacing:1px;margin:6px 0 2px 0;">▶ RAW LOG</div>'
+            f'<div style="background:#080816;color:#555;font-size:10px;padding:4px 8px;'
+            f'border-radius:4px;word-break:break-all;">{raw}</div>'
+        )
+
+        html.append('</div>')
+        self.detail_text.setHtml("".join(html))
 
     def closeEvent(self, event):
         if hasattr(self, "alert_splitter"):
@@ -558,14 +1287,12 @@ class SOCDashboard(QMainWindow):
     # ── Data Fetching ─────────────────────────────────────────────────────────
 
     def _api_headers(self):
-        if self._api_key:
-            return {"X-API-Key": self._api_key}
-        return {}
+        return {"X-API-Key": self._api_key} if self._api_key else {}
 
     def fetch_data(self):
         try:
             limit = self.settings.get("limit", 50)
-            url = f"http://{self.settings['host']}:{self.settings['port']}/incidents?limit={limit}"
+            url   = f"http://{self.settings['host']}:{self.settings['port']}/incidents?limit={limit}"
             r = requests.get(url, headers=self._api_headers(), timeout=1)
             if r.status_code == 200:
                 data = r.json()
@@ -602,10 +1329,10 @@ class SOCDashboard(QMainWindow):
             with self._threat_lock:
                 self._threat_cache[ip] = result
             self._threat_ready.emit(ip)
-            # Evaluate rules with threat score
             if self.db_path:
                 threading.Thread(
-                    target=self._run_rules, args=(ip, "threat_check", "LOW", result.get("abuse_score", 0)),
+                    target=self._run_rules,
+                    args=(ip, "threat_check", "LOW", "", result.get("abuse_score", 0), 0, 0, 0.0),
                     daemon=True
                 ).start()
         get_threat_score_async(self.db_path, ip, _cb)
@@ -620,35 +1347,31 @@ class SOCDashboard(QMainWindow):
         alert_scores = {}
         for alert in self._all_alerts:
             ip = str(alert.get("source_ip", ""))
-            if not ip:
-                continue
+            if not ip: continue
             current = alert_scores.get(ip, {"threat_score": 0, "ai_score": 0, "ai_summary": ""})
             current["threat_score"] = max(current["threat_score"], int(alert.get("threat_score") or 0))
-            current["ai_score"] = max(current["ai_score"], int(alert.get("ai_score") or 0))
+            current["ai_score"]     = max(current["ai_score"],     int(alert.get("ai_score") or 0))
             if alert.get("ai_summary"):
                 current["ai_summary"] = str(alert.get("ai_summary"))
             alert_scores[ip] = current
-        ips = set(snapshot.keys()) | set(alert_scores.keys())
+        ips  = set(snapshot.keys()) | set(alert_scores.keys())
         rows = []
         for ip in ips:
-            intel = snapshot.get(ip, {"ip": ip})
+            intel  = snapshot.get(ip, {"ip": ip})
             scores = alert_scores.get(ip, {})
-            abuse = int(intel.get("abuse_score") or 0)
+            abuse  = int(intel.get("abuse_score") or 0)
             combined = max(abuse, int(scores.get("threat_score") or 0), int(scores.get("ai_score") or 0))
-            row = dict(intel)
-            row.update(scores)
-            row["combined_score"] = combined
+            row = dict(intel); row.update(scores); row["combined_score"] = combined
             rows.append(row)
         rows = sorted(rows, key=lambda x: x.get("combined_score", 0), reverse=True)
         self.threat_table.clearContents(); self.threat_table.setRowCount(len(rows))
         malicious = 0
         for i, info in enumerate(rows):
-            score = int(info.get("combined_score", 0))
-            abuse = int(info.get("abuse_score") or 0)
+            score    = int(info.get("combined_score", 0))
             ai_score = int(info.get("ai_score") or 0)
+            abuse    = int(info.get("abuse_score") or 0)
             label, color = score_to_label(score)
-            if score >= 25:
-                malicious += 1
+            if score >= 25: malicious += 1
             items = [
                 QTableWidgetItem(info.get("ip","")),
                 QTableWidgetItem(str(score)),
@@ -664,91 +1387,154 @@ class SOCDashboard(QMainWindow):
                 self.threat_table.setItem(i, j, item)
         self.lbl_threats.setText(str(malicious))
 
-    # ── Rule Engine ───────────────────────────────────────────────────────────
+    # ── Rule Engine v2 ────────────────────────────────────────────────────────
 
-    def _run_rules(self, ip, event_type, severity, threat_score):
+    def _run_rules(self, ip, event_type, severity, category,
+                   threat_score, behavior_score, vt_score, anomaly_score):
         if not self.db_path:
             return
-        actions = evaluate_rules(self.db_path, ip, event_type, severity, threat_score, self.email_cfg)
+        actions = evaluate_rules_v2(
+            self.db_path, ip, event_type, severity, category,
+            threat_score, behavior_score, vt_score, anomaly_score,
+            "", self.email_cfg,
+        )
         for action in actions:
             self._action_signal.emit(ip, action)
 
-    def _add_rule(self):
-        name  = self.inp_rule_name.text().strip()
-        cond  = self.inp_rule_cond.text().strip().lower()
-        thr   = self.inp_rule_thr.value()
-        win   = self.inp_rule_win.value()
-        act   = self.cmb_rule_act.currentText()
-        if not name or not cond:
-            QMessageBox.warning(self, "Error", "Name and Condition are required."); return
-        add_rule(self.db_path, name, cond, thr, win, act)
-        self.inp_rule_name.clear(); self.inp_rule_cond.clear()
-        self._refresh_rules_tab()
+    def _new_rule(self):
+        dlg = RuleBuilderDialog(self)
+        if dlg.exec():
+            add_rule_v2(self.db_path, dlg.get_data())
+            self._refresh_rules_tab()
+
+    def _edit_rule_row(self, row, _col=0):
+        if row < 0 or row >= len(getattr(self, "_rules_data", [])):
+            return
+        rule = self._rules_data[row]
+        dlg  = RuleBuilderDialog(self, rule=rule)
+        if dlg.exec():
+            update_rule_v2(self.db_path, rule["id"], dlg.get_data())
+            self._refresh_rules_tab()
 
     def _delete_rule(self):
-        selected = self.rules_table.selectedItems()
-        if not selected:
+        rows = {idx.row() for idx in self.rules_table.selectedIndexes()}
+        if not rows:
             QMessageBox.warning(self, "Error", "Select a rule row first."); return
-        row = self.rules_table.currentRow()
-        id_item = self.rules_table.item(row, 0)
-        if id_item:
-            delete_rule(self.db_path, int(id_item.text()))
-            self._refresh_rules_tab()
+        for row in sorted(rows, reverse=True):
+            if row < len(getattr(self, "_rules_data", [])):
+                delete_rule_v2(self.db_path, self._rules_data[row]["id"])
+        self._refresh_rules_tab()
 
     def _refresh_rules_tab(self):
         if not self.db_path:
             return
-        rules = get_rules(self.db_path)
-        self.rules_table.clearContents(); self.rules_table.setRowCount(len(rules))
-        for i, r in enumerate(rules):
-            enabled_chk = QCheckBox()
-            enabled_chk.setChecked(bool(r["enabled"]))
-            rule_id = r["id"]
-            enabled_chk.stateChanged.connect(lambda state, rid=rule_id: toggle_rule(self.db_path, rid, bool(state)))
-            items = [str(r["id"]), r["name"], r["condition"],
-                     str(r["threshold"]), f"{r['window_sec']}s", r["action"]]
-            for j, val in enumerate(items):
-                item = QTableWidgetItem(val)
-                color = "#00ff88" if r["action"] == "email" else "#ff4757"
-                item.setForeground(QColor(color))
-                self.rules_table.setItem(i, j, item)
-            self.rules_table.setCellWidget(i, 6, enabled_chk)
+        rules = get_rules_v2(self.db_path)
+        self._rules_data = rules
+        self.rules_table.clearContents()
+        self.rules_table.setRowCount(len(rules))
 
-    # ── Blocklist Tab ─────────────────────────────────────────────────────────
+        act_icons  = {"action_block": "🚫", "action_email": "📧",
+                      "action_quarantine": "🔒", "action_escalate": "⬆"}
+
+        for i, r in enumerate(rules):
+            # conditions summary
+            try:
+                conds = json.loads(r.get("conditions", "[]"))
+                mode  = r.get("condition_mode", "AND")
+                sep   = f" {mode} "
+                cond_txt = sep.join(
+                    f"{c['field']} {c['op']} {c['value']}" for c in conds
+                ) or "(any)"
+            except Exception:
+                cond_txt = r.get("conditions", "")[:60]
+
+            # actions badge
+            acts = " ".join(v for k, v in act_icons.items() if r.get(k))
+            if r.get("action_webhook"):
+                acts += " 🌐"
+
+            cells = [
+                str(r["priority"]),
+                r["name"],
+                cond_txt,
+                f"{r['threshold']} / {r['window_sec']}s",
+                acts or "—",
+                f"{r['cooldown_sec']}s",
+            ]
+            pri_col = "#ff4757" if r["priority"] <= 20 else \
+                      "#ffa502" if r["priority"] <= 50 else "#74b9ff"
+
+            for j, val in enumerate(cells):
+                item = QTableWidgetItem(val)
+                item.setForeground(QColor(pri_col if j == 0 else
+                                          "#00f2ff" if j == 1 else "#cccccc"))
+                self.rules_table.setItem(i, j, item)
+
+            # Enabled toggle
+            chk = QCheckBox(); chk.setChecked(bool(r["enabled"]))
+            rule_id = r["id"]
+            chk.stateChanged.connect(
+                lambda state, rid=rule_id: toggle_rule_v2(self.db_path, rid, bool(state))
+            )
+            self.rules_table.setCellWidget(i, 6, chk)
+
+            # Edit button
+            btn = QPushButton("Edit")
+            btn.setStyleSheet("background:#2e2e66; padding:2px 6px; font-size:10px;")
+            btn.clicked.connect(lambda _, row=i: self._edit_rule_row(row))
+            self.rules_table.setCellWidget(i, 7, btn)
+
+    # ── Blocklist ─────────────────────────────────────────────────────────────
+
+    def _validate_ip(self, ip: str) -> str:
+        """Return empty string if valid, error message if invalid."""
+        ip = ip.strip()
+        if not ip:
+            return "Enter an IP address."
+        try:
+            ipaddress.ip_address(ip)
+            return ""
+        except ValueError:
+            return f"'{ip}' is not a valid IP address."
 
     def _manual_block(self):
         ip     = self.inp_block_ip.text().strip()
         reason = self.inp_block_reason.text().strip() or "Manual block"
-        if not ip:
-            QMessageBox.warning(self, "Error", "Enter an IP address."); return
+        err    = self._validate_ip(ip)
+        if err:
+            self.lbl_block_err.setText(f"⚠ {err}")
+            return
+        self.lbl_block_err.setText("")
         block_ip(self.db_path, ip, reason)
-        self.inp_block_ip.clear(); self.inp_block_reason.clear()
+        self.inp_block_ip.clear()
+        self.inp_block_reason.clear()
         self._refresh_blocklist_tab()
 
     def _manual_unblock(self):
-        for row in range(self.blocklist_table.rowCount()):
-            chk = self.blocklist_table.cellWidget(row, 3)
-            if chk and chk.isChecked():
-                ip_item = self.blocklist_table.item(row, 0)
-                if ip_item:
-                    unblock_ip(self.db_path, ip_item.text())
+        selected_rows = {idx.row() for idx in self.blocklist_table.selectedIndexes()}
+        if not selected_rows:
+            QMessageBox.warning(self, "Unblock", "Select one or more rows first."); return
+        for row in selected_rows:
+            ip_item = self.blocklist_table.item(row, 0)
+            if ip_item:
+                unblock_ip(self.db_path, ip_item.text())
         self._refresh_blocklist_tab()
 
     def _refresh_blocklist_tab(self):
         if not self.db_path:
             return
         bl = get_blocklist(self.db_path)
-        self.blocklist_table.clearContents(); self.blocklist_table.setRowCount(len(bl))
+        self.blocklist_table.clearContents()
+        self.blocklist_table.setRowCount(len(bl))
         for i, entry in enumerate(bl):
-            chk = QCheckBox()
-            self.blocklist_table.setItem(i, 0, QTableWidgetItem(entry.get("ip","")))
-            self.blocklist_table.setItem(i, 1, QTableWidgetItem(entry.get("reason","")))
-            self.blocklist_table.setItem(i, 2, QTableWidgetItem(str(entry.get("added_at",""))[:19]))
-            self.blocklist_table.setCellWidget(i, 3, chk)
-            for j in range(3):
-                item = self.blocklist_table.item(i, j)
-                if item:
-                    item.setForeground(QColor("#ff4757"))
+            for j, val in enumerate([
+                entry.get("ip", ""),
+                entry.get("reason", ""),
+                str(entry.get("added_at", ""))[:19],
+            ]):
+                item = QTableWidgetItem(val)
+                item.setForeground(QColor("#ff4757" if j == 0 else "#cccccc"))
+                self.blocklist_table.setItem(i, j, item)
         self.lbl_blocked.setText(str(len(bl)))
 
     # ── Alert Processing ──────────────────────────────────────────────────────
@@ -756,8 +1542,8 @@ class SOCDashboard(QMainWindow):
     def process_incoming_alerts(self, data):
         self._all_alerts = data
         try:
-            previous_ids = set(self._prev_ids)
-            new_ids = {a.get("id") for a in data}
+            previous_ids  = set(self._prev_ids)
+            new_ids       = {a.get("id") for a in data}
             new_criticals = [a for a in data if a.get("id") not in previous_ids
                              and str(a.get("severity","")).upper() == "CRITICAL"]
             if new_criticals and HAS_SOUND:
@@ -770,9 +1556,9 @@ class SOCDashboard(QMainWindow):
 
             has_critical = any(str(a.get("severity","")).upper() in ("CRITICAL","HIGH") for a in data)
             if has_critical:
-                self.lbl_risk.setText("CRITICAL"); self.lbl_risk.setStyleSheet("font-size: 35px; color: #ff4757; font-weight: bold;")
+                self.lbl_risk.setText("CRITICAL"); self.lbl_risk.setStyleSheet("font-size: 26px; color: #ff4757; font-weight: bold;")
             else:
-                self.lbl_risk.setText("NORMAL"); self.lbl_risk.setStyleSheet("font-size: 35px; color: #00ff88; font-weight: bold;")
+                self.lbl_risk.setText("NORMAL");   self.lbl_risk.setStyleSheet("font-size: 26px; color: #00ff88; font-weight: bold;")
 
             self.trend_points.append(len(data))
             if len(self.trend_points) > 20: self.trend_points.pop(0)
@@ -780,8 +1566,8 @@ class SOCDashboard(QMainWindow):
 
             sev_rank = {"CRITICAL":4,"HIGH":3,"MEDIUM":2,"LOW":1}
             for alert in data:
-                ip  = str(alert.get("source_ip","0.0.0.0"))
-                sev = str(alert.get("severity","LOW")).upper()
+                ip    = str(alert.get("source_ip","0.0.0.0"))
+                sev   = str(alert.get("severity","LOW")).upper()
                 etype = str(alert.get("event_type","System Event"))
                 if ip == "0.0.0.0": continue
                 self._all_ips.add(ip)
@@ -794,17 +1580,29 @@ class SOCDashboard(QMainWindow):
                     threat_missing = ip not in self._threat_cache
                 if threat_missing:
                     threading.Thread(target=self._enrich_ip, args=(ip,), daemon=True).start()
-                # Run rule engine for new alerts only
                 if alert.get("id") not in previous_ids and self.db_path:
-                    with self._threat_lock:
-                        t_score = self._threat_cache.get(ip, {}).get("abuse_score", 0)
-                    threading.Thread(target=self._run_rules, args=(ip, etype, sev, t_score), daemon=True).start()
+                    threading.Thread(
+                        target=self._run_rules,
+                        args=(
+                            ip, etype, sev,
+                            str(alert.get("category", "")),
+                            int(alert.get("threat_score") or 0),
+                            int(alert.get("behavior_score") or 0),
+                            int(alert.get("vt_score") or 0),
+                            float(alert.get("anomaly_score") or 0),
+                        ),
+                        daemon=True,
+                    ).start()
 
             self._prev_ids = new_ids
             self.filter_table()
             self._refresh_threat_tab()
             self.update_stats_tab(data)
             self.update_timeline(data)
+            self._refresh_reports_tab()
+            self._refresh_blocklist_tab()
+            self._refresh_rules_tab()
+            self._show_selected_alert_details()  # re-render if deepseek report arrived
 
         except Exception as e:
             print(f"!!! PROCESS ERROR: {e}")
@@ -845,7 +1643,7 @@ class SOCDashboard(QMainWindow):
 
     def filter_table(self):
         search = self.search_bar.text().lower() if hasattr(self, "search_bar") else ""
-        data = self._all_alerts
+        data   = self._all_alerts
         with self._geo_lock:    geo_snap    = dict(self._geo_cache)
         with self._threat_lock: threat_snap = dict(self._threat_cache)
 
@@ -868,76 +1666,71 @@ class SOCDashboard(QMainWindow):
             country  = geo_snap.get(ip_val,{}).get("country","Detecting...")
             color    = SEV_COLORS.get(sev_val.upper(),"#ffffff")
             t_info   = threat_snap.get(ip_val,{})
-            stored_score = int(alert.get("threat_score") or 0)
-            ai_score = int(alert.get("ai_score") or 0)
-            abuse_score = int(t_info.get("abuse_score") if t_info.get("abuse_score") is not None else -1)
-            t_score  = max(stored_score, ai_score, abuse_score)
+            stored   = int(alert.get("threat_score") or 0)
+            ai_s     = int(alert.get("ai_score") or 0)
+            abuse_s  = int(t_info.get("abuse_score") if t_info.get("abuse_score") is not None else -1)
+            t_score  = max(stored, ai_s, abuse_s)
             t_label, t_color = score_to_label(t_score)
             threat_text = f"{t_label} ({t_score})" if t_score >= 0 else "CHECKING..."
             if status in ("Resolved","False Positive"):
                 color = t_color = "#555555"
             ts_item = QTableWidgetItem(ts_val)
             ts_item.setData(Qt.ItemDataRole.UserRole, alert.get("id"))
-            cells = [(ts_item,color),(QTableWidgetItem(ip_val),color),(QTableWidgetItem(country),color),
-                     (QTableWidgetItem(type_val),color),(QTableWidgetItem(sev_val),color),
-                     (QTableWidgetItem(threat_text),t_color),(QTableWidgetItem(status),color)]
-            for j,(item,c) in enumerate(cells):
-                item.setForeground(QColor(c)); self.table.setItem(i,j,item)
+            cells = [
+                (ts_item, color), (QTableWidgetItem(ip_val), color),
+                (QTableWidgetItem(country), color), (QTableWidgetItem(type_val), color),
+                (QTableWidgetItem(sev_val), color), (QTableWidgetItem(threat_text), t_color),
+                (QTableWidgetItem(status), color),
+            ]
+            for j, (item, c) in enumerate(cells):
+                item.setForeground(QColor(c)); self.table.setItem(i, j, item)
+
+    # ── Stats tab ─────────────────────────────────────────────────────────────
 
     def update_stats_tab(self, data):
         import math
         counts = Counter(a.get("event_type", "Unknown") for a in data)
         total  = len(data)
-
-        # ── Pie chart ──
         CHART_COLORS = [
             "#ff4757","#ffa502","#ff6b81","#ff0000","#a29bfe",
             "#fd79a8","#00ff88","#74b9ff","#6c5ce7","#00cec9",
         ]
+
+        # Pie chart
         self.pie_widget.clear()
         if total > 0:
-            items = counts.most_common()
-            angle = 0.0
-            legend_y = 1.2
+            items  = counts.most_common()
+            angle  = 0.0
             for idx, (etype, count) in enumerate(items):
                 frac  = count / total
                 sweep = frac * 360.0
                 color = CHART_COLORS[idx % len(CHART_COLORS)]
-                # Draw pie slice as filled arc approximation using polygon
                 pts_x, pts_y = [0.0], [0.0]
                 steps = max(3, int(sweep / 3))
                 for s in range(steps + 1):
                     a = math.radians(angle + s * sweep / steps)
-                    pts_x.append(math.cos(a))
-                    pts_y.append(math.sin(a))
+                    pts_x.append(math.cos(a)); pts_y.append(math.sin(a))
                 pts_x.append(0.0); pts_y.append(0.0)
                 r, g, b = int(color[1:3],16), int(color[3:5],16), int(color[5:7],16)
-                fill = pg.mkBrush(r, g, b, 200)
-                outline = pg.mkPen(color="#0b0b1a", width=2)
                 poly = pg.PlotDataItem(pts_x, pts_y, fillLevel=0,
-                                       brush=fill, pen=outline)
+                                       brush=pg.mkBrush(r,g,b,200),
+                                       pen=pg.mkPen("#0b0b1a", width=2))
                 self.pie_widget.addItem(poly)
-                # Label on slice
-                mid_a = math.radians(angle + sweep / 2)
-                lx = math.cos(mid_a) * 0.6
-                ly = math.sin(mid_a) * 0.6
                 if frac > 0.05:
+                    mid_a = math.radians(angle + sweep / 2)
                     txt = pg.TextItem(f"{frac*100:.0f}%", color=color, anchor=(0.5, 0.5))
-                    txt.setPos(lx, ly)
+                    txt.setPos(math.cos(mid_a)*0.6, math.sin(mid_a)*0.6)
                     self.pie_widget.addItem(txt)
                 angle += sweep
-            # Legend on the right
             for idx, (etype, count) in enumerate(items[:8]):
                 color = CHART_COLORS[idx % len(CHART_COLORS)]
-                legend_txt = pg.TextItem(
-                    f"■ {etype[:18]} ({count})", color=color, anchor=(0, 0.5)
-                )
+                legend_txt = pg.TextItem(f"■ {etype[:18]} ({count})", color=color, anchor=(0,0.5))
                 legend_txt.setPos(1.15, 1.1 - idx * 0.28)
                 self.pie_widget.addItem(legend_txt)
             self.pie_widget.setXRange(-1.1, 2.6, padding=0)
             self.pie_widget.setYRange(-1.2, 1.4, padding=0)
 
-        # ── Severity bar chart ──
+        # Severity bar chart
         self.sev_widget.clear()
         sev_order  = ["CRITICAL","HIGH","MEDIUM","LOW"]
         sev_colors = ["#ff0000","#ff4757","#ffa502","#00ff88"]
@@ -953,10 +1746,9 @@ class SOCDashboard(QMainWindow):
         for i, (cnt, color) in enumerate(zip(sev_counts, sev_colors)):
             if cnt > 0:
                 lbl = pg.TextItem(str(cnt), color=color, anchor=(0.5, 1.0))
-                lbl.setPos(i, cnt)
-                self.sev_widget.addItem(lbl)
+                lbl.setPos(i, cnt); self.sev_widget.addItem(lbl)
 
-        # ── Heatmap (day × hour scatter) ──
+        # Heatmap
         self.heat_widget.clear()
         day_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
         heat = defaultdict(int)
@@ -966,34 +1758,26 @@ class SOCDashboard(QMainWindow):
                 try:
                     dt = datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
                     heat[(dt.weekday(), dt.hour)] += 1
-                except:
-                    pass
+                except: pass
         if heat:
             max_val = max(heat.values()) or 1
             for (day, hour), cnt in heat.items():
                 intensity = cnt / max_val
-                r = int(108 + 147 * intensity)
-                g = int(92  - 92  * intensity)
-                b = int(231 - 231 * intensity)
-                size = 6 + int(18 * intensity)
-                dot = pg.ScatterPlotItem(
-                    x=[hour], y=[day],
-                    size=size,
-                    brush=pg.mkBrush(r, g, b, 200),
-                    pen=pg.mkPen(None)
-                )
+                r = int(108 + 147 * intensity); g = int(92 - 92 * intensity); b = int(231 - 231 * intensity)
+                size = 5 + int(16 * intensity)
+                dot = pg.ScatterPlotItem(x=[hour], y=[day], size=size,
+                                         brush=pg.mkBrush(r,g,b,200), pen=pg.mkPen(None))
                 self.heat_widget.addItem(dot)
         ax_l = self.heat_widget.getAxis("left")
-        ax_l.setTicks([[(i, d) for i, d in enumerate(day_names)]])
-        ax_l.setTextPen("#00f2ff")
+        ax_l.setTicks([[(i, d) for i, d in enumerate(day_names)]]); ax_l.setTextPen("#00f2ff")
         self.heat_widget.getAxis("bottom").setTextPen("#00f2ff")
         self.heat_widget.setYRange(-0.5, 6.5, padding=0)
         self.heat_widget.setXRange(-0.5, 23.5, padding=0)
 
-        # ── Table ──
+        # Table
         self.stats_table.clearContents(); self.stats_table.setRowCount(len(counts))
-        for i,(etype,count) in enumerate(counts.most_common()):
-            pct = f"{(count/total*100):.1f}%" if total>0 else "0%"
+        for i, (etype, count) in enumerate(counts.most_common()):
+            pct   = f"{(count/total*100):.1f}%" if total > 0 else "0%"
             color = CHART_COLORS[i % len(CHART_COLORS)]
             for j, val in enumerate([etype, str(count), pct]):
                 item = QTableWidgetItem(val)
@@ -1012,29 +1796,31 @@ class SOCDashboard(QMainWindow):
             hours  = list(range(24))
             counts = [hour_counts.get(h,0) for h in hours]
             self.timeline_widget.clear()
-            bg = pg.BarGraphItem(x=hours,height=counts,width=0.6,brush="#6c5ce7",pen=pg.mkPen("#a29bfe"))
+            bg = pg.BarGraphItem(x=hours, height=counts, width=0.6,
+                                 brush="#6c5ce7", pen=pg.mkPen("#a29bfe"))
             self.timeline_widget.addItem(bg)
         except Exception as e:
             print(f"[TIMELINE ERROR] {e}")
 
     def update_world_map(self):
         try:
-            m = folium.Map(location=[20,0],zoom_start=2,tiles="OpenStreetMap")
+            m = folium.Map(location=[20,0], zoom_start=2, tiles="OpenStreetMap")
             with self._geo_lock:    geo_snap    = dict(self._geo_cache)
             with self._threat_lock: threat_snap = dict(self._threat_cache)
             for ip in self._all_ips:
                 geo = geo_snap.get(ip,{})
-                lat,lng = geo.get("lat",0),geo.get("lng",0)
-                if lat==0 and lng==0: continue
+                lat, lng = geo.get("lat",0), geo.get("lng",0)
+                if lat == 0 and lng == 0: continue
                 sev    = self._ip_severity.get(ip,"LOW")
-                t_score= threat_snap.get(ip,{}).get("abuse_score",-1)
+                t_score = threat_snap.get(ip,{}).get("abuse_score",-1)
                 t_label,_ = score_to_label(t_score)
                 popup_text = f"{ip} ({geo.get('country','?')})<br>Severity: {sev}<br>Threat: {t_label} ({t_score})"
-                folium.Marker(location=[lat,lng],
-                    popup=folium.Popup(popup_text,max_width=200),
-                    icon=folium.Icon(color=MAP_COLORS.get(sev,"blue"),icon="info-sign")
+                folium.Marker(
+                    location=[lat,lng],
+                    popup=folium.Popup(popup_text, max_width=200),
+                    icon=folium.Icon(color=MAP_COLORS.get(sev,"blue"), icon="info-sign")
                 ).add_to(m)
-            buf = io.BytesIO(); m.save(buf,close_file=False)
+            buf = io.BytesIO(); m.save(buf, close_file=False)
             self.web_view.setHtml(buf.getvalue().decode())
         except Exception as e:
             print(f"[MAP ERROR] {e}")
