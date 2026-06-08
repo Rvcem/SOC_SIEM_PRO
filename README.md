@@ -56,12 +56,18 @@ SOC-SIEM PRO blends statistical analysis, unsupervised learning, and stateful be
 │   ├── app.py                   # Main View: PyQt6 SOC Management Interface (SOCDashboard)
 │   └── tests/
 │       └── test_regressions.py  # Unit verification and regression testing suites
+├── core/
+│   ├── ollama_reporter.py       # Ollama-powered incident report generator (background, non-blocking)
+│   ├── virustotal.py            # VirusTotal hash intelligence integration
+│   └── behavioral.py           # Behavioral heuristics and pattern analysis
 ├── threat_intel.py              # AbuseIPDB API orchestration and local caching layer (24h)
 ├── responder.py                 # SOAR workflow management (Rules, Notification routing, Blocklists)
 ├── sandbox_integrations.py      # Asynchronous artifact submission pipelines (Cuckoo/Litterbox)
 ├── siem_listener.py             # Standalone production UDP syslog ingestion service
 ├── start.py                     # Monolithic startup orchestration (UDP Ingestion + Flask API + PyQt6 GUI)
 └── test_siem.py                 # Multi-vector adversarial emulation and attack simulator
+```
+
 ## Run
 
 ### 1. Install
@@ -69,16 +75,22 @@ SOC-SIEM PRO blends statistical analysis, unsupervised learning, and stateful be
 pip install -r requirements.txt
 ```
 
-### 2. Optional Environment
+### 2. Configure Environment
+Copy `.env.example` to `.env` and fill in your API keys:
 ```bash
-set ABUSEIPDB_API_KEY=your_abuseipdb_key
-set SOC_ADMIN_PASSWORD=choose_a_strong_admin_password
+cp .env.example .env
 ```
 
-If `SOC_ADMIN_PASSWORD` is not set on a fresh database, `start.py` creates the
-`admin` user with a generated one-time password and prints it in the console.
+### 3. Start Ollama
+The app connects to a locally running Ollama instance for AI-powered report generation.
+Ollama must be started **before** launching the app:
+```bash
+ollama serve
+```
 
-### 3. Start The Integrated App
+> If Ollama is not running, the app still works — report generation is silently skipped.
+
+### 4. Start The Integrated App
 ```bash
 python start.py
 ```
