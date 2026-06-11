@@ -1,11 +1,12 @@
-import sys, io, json, folium, requests, pyqtgraph as pg, threading
+import sys, io, json, os, folium, requests, pyqtgraph as pg, threading
+from concurrent.futures import ThreadPoolExecutor
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import *
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from fpdf import FPDF
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 import ipaddress
 from core.schema import get_app_config, set_app_config
 from core.ollama_reporter import get_recent_reports, generate_report_async
@@ -107,10 +108,111 @@ STYLE_SOC = """
     QSplitter::handle:vertical { height: 5px; }
 
     QTextEdit { font-size: 12px; }
+
+    QTextBrowser#chat_browser {
+        background-color: #0b0b1a;
+        border: none;
+        font-family: 'Segoe UI', sans-serif;
+        font-size: 12px;
+        padding: 4px;
+    }
+    QPushButton#chat_quick {
+        background-color: #1c1c44;
+        color: #a0a0cc;
+        border: 1px solid #2e2e66;
+        border-radius: 5px;
+        padding: 5px 10px;
+        font-size: 11px;
+        text-align: left;
+        min-height: 28px;
+        font-weight: normal;
+    }
+    QPushButton#chat_quick:hover {
+        background-color: #252565;
+        color: #00f2ff;
+        border-color: #4a4a9a;
+    }
+    QPushButton#chat_quick:pressed { background-color: #1a1a3a; }
 """
 
 SEV_COLORS = {"CRITICAL": "#ff0000", "HIGH": "#ff4757", "MEDIUM": "#ffa502", "LOW": "#00ff88"}
 MAP_COLORS = {"CRITICAL": "red", "HIGH": "orange", "MEDIUM": "blue", "LOW": "green"}
+
+# ── SOC Assist chatbot ────────────────────────────────────────────────────────
+
+_CHAT_SYSTEM = """You are SOC Assist, an AI assistant embedded in SOC SIEM PRO — a security operations platform with real-time threat detection, behavioral analytics, and AI-powered incident analysis.
+
+You serve three functions:
+1. Application guide — navigate analysts to the right tab, field, or action
+2. Decision support — triage incidents, interpret scores, recommend responses
+3. Threat intelligence assistant — explain attack patterns, interpret logs, IOC analysis
+
+## APPLICATION LAYOUT
+
+**Live Alerts tab** — Real-time incident table (Timestamp | Source IP | Country | Type | Severity | Threat Score | Status). Click any row to open the detail panel below with the full log, enrichment data, and AI report. Use the A−/A+ buttons next to the search bar to adjust font size.
+
+**Blocklist tab** — Manually block or unblock IPs. Enter IP → Block. Select row → Unblock. Input is validated. Auto-blocked IPs (threat score ≥ 90) also appear here.
+
+**Rule Engine tab** — Create multi-condition detection rules. Click "+ NEW RULE" → fill Rule Builder dialog. Conditions: field (event_type, severity, source_ip, threat_score, behavior_score, vt_score, anomaly_score, raw_log, hour, day_of_week) + operator (eq, neq, contains, regex, in, gt, lt, gte, lte, between) + value. Logic: AND or OR. Actions: block, email, quarantine, escalate, webhook. Each rule has priority, cooldown, stop_on_match, CIDR exclusion.
+
+**AI Reports tab** — Per-incident deepseek analysis: MITRE ATT&CK tactics, IOCs, recommended actions, confidence. LOW severity + score < 30 do not generate reports.
+
+**Threat Intel tab** — AbuseIPDB confidence scores per source IP.
+
+**Stats tab** — Severity distribution chart, top offending IPs bar chart, event type breakdown.
+
+## SCORING
+
+Threat Score (0–100): composite of heuristic + Ollama LLM + VirusTotal + behavioral + Shodan + GreyNoise + URLScan + anomaly. Auto-block at 90 (SOC_AUTO_BLOCK_SCORE).
+- 90+: auto-blocked
+- 70–89: high priority, manual review
+- 50–69: monitor and correlate
+- <50: informational
+
+Detection layers: signature regex matching, IsolationForest anomaly (z-score per IP), behavioral sliding windows (password spray, credential stuffing, distributed brute-force, beaconing CV, lateral movement, low-and-slow port scan, DNS tunneling).
+
+Enrichment (async, per incident): VirusTotal hash + URL, Shodan open ports/CVEs, GreyNoise mass-scanner classification, URLScan.io URL sandbox.
+
+## RESPONSE FORMAT
+
+Navigation: exact tab name + specific action steps. 2–5 lines max.
+
+Triage: always use this block:
+  Severity: [CRITICAL/HIGH/MEDIUM/LOW]
+  Confidence: [High/Medium/Low]
+  Recommended Action: [steps]
+  Rationale: [1–3 sentences, evidence-based]
+
+Log/JSON input: extract source IP, event type, severity, timestamps, IOCs. Identify patterns. Suggest MITRE ATT&CK techniques by ID.
+
+Rules of engagement:
+- Recommend block if score ≥ 90, or 70–89 with behavioral signal
+- At 70–89 without behavioral signal: monitor + manual enrichment
+- Below 70: do not recommend block without corroborating signals
+- Never invent reputation data — direct to Threat Intel tab, VirusTotal, or Shodan enrichment
+- No filler phrases. Professional and direct. Bullets over paragraphs.
+
+## MITRE QUICK REFERENCE
+T1110 Brute Force | T1110.003 Password Spraying | T1110.004 Credential Stuffing
+T1046 Network Service Discovery (port scan) | T1595.001 Active Scanning
+T1071 Application Layer Protocol (C2) | T1071.004 DNS tunneling
+T1498 Network DoS | T1021 Remote Services (lateral movement)"""
+
+_CHAT_QUICK_ACTIONS = [
+    ("Shift Summary (8h)",         "shift_summary"),
+    ("Analyze Selected Incident",  "analyze_selected"),
+    ("Should I Block This IP?",    "block_decision"),
+    ("Explain This Log",           "explain_log"),
+    ("Suggest Detection Rule",     "suggest_rule"),
+    ("MITRE ATT&CK Mapping",       "mitre_map"),
+]
+
+_CHAT_PLAYBOOKS = [
+    ("Playbook: Brute Force",  "playbook_bruteforce"),
+    ("Playbook: C2 / Beaconing", "playbook_c2"),
+    ("Playbook: Port Scan",    "playbook_portscan"),
+    ("Playbook: DDoS",         "playbook_ddos"),
+]
 EVENT_TYPES = [
     ("BRUTEFORCE", "#ff4757"), ("PORT SCAN", "#ffa502"), ("SQL INJECTION", "#ff6b81"),
     ("DDOS", "#ff0000"), ("MALWARE", "#a29bfe"), ("ANOMALY DETECTED", "#fd79a8"),
@@ -520,8 +622,9 @@ class RuleBuilderDialog(QDialog):
 # ── Main Dashboard ────────────────────────────────────────────────────────────
 
 class SOCDashboard(QMainWindow):
-    _threat_ready  = pyqtSignal(str)
-    _action_signal = pyqtSignal(str, str)
+    _threat_ready   = pyqtSignal(str)
+    _action_signal  = pyqtSignal(str, str)
+    _chat_reply_sig = pyqtSignal(str)   # Ollama chat response → main thread
 
     def __init__(self, username="operator", role="analyst", db_path=None, api_key=None):
         super().__init__()
@@ -540,7 +643,7 @@ class SOCDashboard(QMainWindow):
         self.trend_points  = [0]
         self._all_alerts   = []
         self._all_ips      = set()
-        self._geo_cache    = {}
+        self._geo_cache    = {}      # ip → dict | None (None = lookup in-flight)
         self._geo_lock     = threading.Lock()
         self._ip_severity  = {}
         self._prev_ids     = set()
@@ -550,6 +653,11 @@ class SOCDashboard(QMainWindow):
         self.email_cfg     = load_email_config(db_path) if db_path else {}
         self._reports_data = []
         self.gui_zoom      = self._load_int_pref("gui_zoom", 10)
+        # Bounded thread pool for background geo/enrich/rule tasks
+        self._bg_pool      = ThreadPoolExecutor(max_workers=8)
+        # Report cache: avoid re-querying SQLite every 500ms for the same alert
+        self._last_report_id  = None
+        self._last_report     = None
 
         sw = _screen_w()
         default_left  = int(sw * 0.38)
@@ -658,6 +766,7 @@ class SOCDashboard(QMainWindow):
         self._build_tab_reports()
         self._build_tab_blocklist()
         self._build_tab_rules()
+        self._build_tab_chat()
 
     def _build_tab_alerts(self):
         sh = _screen_h()
@@ -1234,14 +1343,24 @@ class SOCDashboard(QMainWindow):
                     f'margin:6px 0 2px 0;">▶ {title}</div>'
                     f'<div style="padding-left:8px;margin-bottom:4px;">{content_html}</div>')
 
-        # ── Fetch deepseek report ─────────────────────────────────────────────
+        # ── Fetch deepseek report (cache by ID — avoid repeated DB hits every 500ms) ──
         report = None
         if self.db_path and alert_id:
-            try:
-                from core.ollama_reporter import get_report
-                report = get_report(self.db_path, alert_id)
-            except Exception:
-                pass
+            if alert_id != self._last_report_id:
+                # New selection: clear cache, will fetch below
+                self._last_report_id = alert_id
+                self._last_report    = None
+            if self._last_report is None:
+                try:
+                    from core.ollama_reporter import get_report
+                    fetched = get_report(self.db_path, alert_id)
+                    if fetched:
+                        self._last_report = fetched
+                    report = fetched
+                except Exception:
+                    pass
+            else:
+                report = self._last_report
 
         # ── Build HTML ────────────────────────────────────────────────────────
         html = ['<div style="background:#0a0a1e;color:#fff;font-family:Consolas,monospace;font-size:11px;padding:6px;">']
@@ -1443,6 +1562,410 @@ class SOCDashboard(QMainWindow):
             self._save_pref("alert_split_sizes", self.alert_splitter.sizes())
         self._save_pref("gui_zoom", self.gui_zoom)
         super().closeEvent(event)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SOC ASSIST — AI Chatbot Tab
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_tab_chat(self):
+        self._chat_history  = []
+        self._chat_typing   = False
+        self._chat_reply_sig.connect(self._on_chat_reply)
+
+        tab = QWidget(); tl = QVBoxLayout(tab)
+        tl.setContentsMargins(8, 8, 8, 8)
+        tl.setSpacing(8)
+
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        lbl_title = QLabel("SOC ASSIST")
+        lbl_title.setStyleSheet(
+            "font-size:13px;color:#00f2ff;font-weight:bold;letter-spacing:1px;")
+        model_name = os.getenv("OLLAMA_MODEL", "llama3.1")
+        lbl_model = QLabel(f"powered by {model_name}")
+        lbl_model.setStyleSheet("font-size:10px;color:#555580;padding-left:8px;")
+        btn_clear = QPushButton("Clear Chat")
+        btn_clear.setObjectName("danger")
+        btn_clear.setFixedWidth(90)
+        btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_clear.clicked.connect(self._chat_clear)
+        hdr.addWidget(lbl_title)
+        hdr.addWidget(lbl_model)
+        hdr.addStretch()
+        hdr.addWidget(btn_clear)
+        tl.addLayout(hdr)
+
+        # ── Splitter: chat area (left) + sidebar (right) ──────────────────────
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # ── Left: chat history + input ────────────────────────────────────────
+        chat_frame = QFrame(); chat_frame.setObjectName("Card")
+        cv = QVBoxLayout(chat_frame)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(0)
+
+        self._chat_browser = QTextBrowser()
+        self._chat_browser.setObjectName("chat_browser")
+        self._chat_browser.setOpenExternalLinks(False)
+        self._chat_browser.setReadOnly(True)
+        cv.addWidget(self._chat_browser, 1)
+
+        self._chat_typing_lbl = QLabel("  SOC Assist is thinking...")
+        self._chat_typing_lbl.setStyleSheet(
+            "color:#555580;font-size:11px;padding:4px 14px;font-style:italic;")
+        self._chat_typing_lbl.hide()
+        cv.addWidget(self._chat_typing_lbl)
+
+        inp_row = QHBoxLayout()
+        inp_row.setContentsMargins(8, 6, 8, 8)
+        inp_row.setSpacing(8)
+        self._chat_input = QLineEdit()
+        self._chat_input.setPlaceholderText(
+            "Ask about the application, an incident, a log, or a threat...")
+        self._chat_input.setMinimumHeight(36)
+        self._chat_input.returnPressed.connect(self._chat_send)
+        self._chat_send_btn = QPushButton("SEND")
+        self._chat_send_btn.setFixedWidth(80)
+        self._chat_send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._chat_send_btn.clicked.connect(self._chat_send)
+        inp_row.addWidget(self._chat_input)
+        inp_row.addWidget(self._chat_send_btn)
+        cv.addLayout(inp_row)
+
+        splitter.addWidget(chat_frame)
+
+        # ── Right: sidebar ────────────────────────────────────────────────────
+        sidebar = QFrame(); sidebar.setObjectName("Card")
+        sv = QVBoxLayout(sidebar)
+        sv.setContentsMargins(10, 10, 10, 10)
+        sv.setSpacing(5)
+
+        def _sidebar_section(text):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                "font-size:11px;color:#00f2ff;font-weight:bold;letter-spacing:1px;"
+                "padding-top:4px;")
+            sv.addWidget(lbl)
+
+        _sidebar_section("QUICK ACTIONS")
+        for label, key in _CHAT_QUICK_ACTIONS:
+            b = QPushButton(label)
+            b.setObjectName("chat_quick")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _, k=key: self._chat_quick(k))
+            sv.addWidget(b)
+
+        sv.addSpacing(4)
+        div = QFrame(); div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet("background:#2e2e66;max-height:1px;")
+        sv.addWidget(div)
+        sv.addSpacing(4)
+
+        _sidebar_section("PLAYBOOKS")
+        for label, key in _CHAT_PLAYBOOKS:
+            b = QPushButton(label)
+            b.setObjectName("chat_quick")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _, k=key: self._chat_quick(k))
+            sv.addWidget(b)
+
+        sv.addSpacing(4)
+        div2 = QFrame(); div2.setFrameShape(QFrame.Shape.HLine)
+        div2.setStyleSheet("background:#2e2e66;max-height:1px;")
+        sv.addWidget(div2)
+        sv.addSpacing(4)
+
+        _sidebar_section("SELECTED INCIDENT")
+        self._chat_ctx_lbl = QLabel("No incident selected.\nSelect a row in\nLive Alerts tab.")
+        self._chat_ctx_lbl.setStyleSheet(
+            "color:#555580;font-size:10px;line-height:1.6;padding-top:2px;")
+        self._chat_ctx_lbl.setWordWrap(True)
+        sv.addWidget(self._chat_ctx_lbl)
+
+        sv.addStretch()
+        sidebar.setMinimumWidth(170)
+        sidebar.setMaximumWidth(230)
+        splitter.addWidget(sidebar)
+
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 1)
+        tl.addWidget(splitter, 1)
+
+        self.tabs.addTab(tab, "SOC Assist")
+
+        # Welcome message
+        self._chat_history.append({"role": "assistant", "content": (
+            "Hello. I'm **SOC Assist** — your AI analyst companion.\n\n"
+            "I can help you:\n"
+            "- **Navigate** this application (blocklist, rule engine, AI reports)\n"
+            "- **Triage** incidents — should I block? what does this score mean?\n"
+            "- **Interpret** raw logs and enrichment data\n"
+            "- **Suggest** detection rules and response playbooks\n\n"
+            "Select an incident in **Live Alerts** and click **Analyze Selected Incident** "
+            "to start, or type any question below."
+        )})
+        self._chat_render()
+
+    # ── Chat helpers ──────────────────────────────────────────────────────────
+
+    def _chat_render(self):
+        import re as _re
+
+        def _esc(s):
+            return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+        def _md(text):
+            # Escape HTML in the full input first — neutralizes any injected tags
+            # from attacker-controlled log content before we apply markdown patterns.
+            # Backticks, asterisks, and MITRE T-numbers are unaffected by HTML escaping.
+            text = _esc(text)
+            # fenced code blocks (content already escaped)
+            text = _re.sub(
+                r'```[^\n]*\n?(.*?)```',
+                lambda m: (
+                    '<pre style="background:#0d0d28;border:1px solid #2e2e66;'
+                    'border-radius:4px;padding:7px 10px;font-size:11px;'
+                    'white-space:pre-wrap;margin:4px 0;">'
+                    + m.group(1) + '</pre>'),
+                text, flags=_re.DOTALL)
+            # inline code (content already escaped)
+            text = _re.sub(
+                r'`([^`]+)`',
+                lambda m: (
+                    '<code style="background:#0d0d28;color:#00f2ff;'
+                    'padding:1px 5px;border-radius:3px;font-size:11px;">'
+                    + m.group(1) + '</code>'),
+                text)
+            # bold (content already escaped)
+            text = _re.sub(r'\*\*(.+?)\*\*',
+                           lambda m: '<strong style="color:#a29bfe;">' + m.group(1) + '</strong>',
+                           text)
+            # bullet lines (content already escaped)
+            text = _re.sub(r'^[-•] (.+)$',
+                           lambda m: '<span style="color:#555580;">&#x25B8;</span> ' + m.group(1),
+                           text, flags=_re.MULTILINE)
+            # MITRE technique IDs (safe alphanumeric pattern — no user data in capture group)
+            text = _re.sub(r'\b(T\d{4}(?:\.\d{3})?)\b',
+                           lambda m: '<span style="color:#fd79a8;">' + m.group(1) + '</span>',
+                           text)
+            # severity words (safe fixed strings — no user data)
+            for word, col in (("CRITICAL","#ff4757"),("HIGH","#ffa502"),
+                               ("MEDIUM","#f9ca24"),("LOW","#00ff88")):
+                text = text.replace(word,
+                    f'<span style="color:{col};font-weight:bold;">{word}</span>')
+            text = text.replace("\n", "<br>")
+            return text
+
+        parts = [
+            '<html><head><meta charset="utf-8"><style>'
+            'body{margin:0;padding:8px 6px;background:#0b0b1a;}'
+            '</style></head><body>'
+        ]
+        for msg in self._chat_history:
+            role    = msg["role"]
+            content = _md(msg.get("content",""))
+            if role == "user":
+                parts.append(
+                    '<div style="margin:10px 0 10px 40px;text-align:right;">'
+                    '<div style="font-size:10px;color:#6c5ce7;margin-bottom:3px;">'
+                    'YOU</div>'
+                    '<div style="display:inline-block;max-width:82%;background:#26184a;'
+                    'border:1px solid #6c5ce7;border-radius:12px 12px 2px 12px;'
+                    'padding:10px 14px;color:#e0d8ff;font-size:12px;'
+                    'text-align:left;word-wrap:break-word;line-height:1.6;">'
+                    f'{content}</div></div>')
+            else:
+                parts.append(
+                    '<div style="margin:10px 40px 10px 0;">'
+                    '<div style="font-size:10px;color:#00f2ff;margin-bottom:3px;'
+                    'letter-spacing:1px;">SOC ASSIST</div>'
+                    '<div style="max-width:90%;background:#131328;'
+                    'border:1px solid #2e2e66;border-radius:12px 12px 12px 2px;'
+                    'padding:10px 14px;color:#d0d0f0;font-size:12px;'
+                    'word-wrap:break-word;line-height:1.6;">'
+                    f'{content}</div></div>')
+        parts.append("</body></html>")
+
+        self._chat_browser.setHtml("".join(parts))
+        sb = self._chat_browser.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _chat_send(self):
+        text = self._chat_input.text().strip()
+        if not text or self._chat_typing:
+            return
+        self._chat_input.clear()
+        self._chat_history.append({"role": "user", "content": text})
+        self._chat_render()
+        self._chat_call_ollama()
+
+    def _chat_call_ollama(self):
+        self._chat_typing = True
+        self._chat_typing_lbl.show()
+        self._chat_send_btn.setEnabled(False)
+        self._chat_input.setEnabled(False)
+
+        messages = [{"role": "system", "content": _CHAT_SYSTEM}]
+        for m in self._chat_history[-24:]:   # keep last 24 turns in context
+            messages.append({"role": m["role"], "content": m["content"]})
+
+        sig = self._chat_reply_sig
+
+        def _worker():
+            try:
+                url   = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+                model = os.getenv("OLLAMA_MODEL", "llama3.1")
+                resp  = requests.post(
+                    f"{url}/api/chat",
+                    json={"model": model, "messages": messages, "stream": False},
+                    timeout=120)
+                data    = resp.json()
+                content = (data.get("message") or {}).get("content")
+                if not content:
+                    err = data.get("error", "")
+                    if err:
+                        content = f"Ollama error: {err}"
+                        if "not found" in err or "pull" in err:
+                            content += f"\n\nFix: run  ollama pull {model}"
+                    else:
+                        content = f"No content in Ollama response (HTTP {resp.status_code})."
+            except Exception as exc:
+                content = (
+                    f"Could not reach Ollama: {exc}\n\n"
+                    "Make sure Ollama is running: `ollama serve`")
+            sig.emit(content)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_chat_reply(self, text):
+        self._chat_typing = False
+        self._chat_typing_lbl.hide()
+        self._chat_send_btn.setEnabled(True)
+        self._chat_input.setEnabled(True)
+        self._chat_history.append({"role": "assistant", "content": text})
+        self._chat_render()
+        self._chat_input.setFocus()
+
+    def _chat_clear(self):
+        self._chat_history.clear()
+        self._chat_render()
+
+    def _chat_get_incident_ctx(self):
+        """Return (context_string, label_text) for the selected incident, or (None, None)."""
+        if not hasattr(self, "table"):
+            return None, None
+        row = self.table.currentRow()
+        if row < 0:
+            return None, None
+        id_item  = self.table.item(row, 0)
+        alert_id = id_item.data(Qt.ItemDataRole.UserRole) if id_item else None
+        alert    = next((a for a in self._all_alerts if a.get("id") == alert_id), None)
+        if not alert:
+            return None, None
+
+        ip  = str(alert.get("source_ip","?"))
+        sev = str(alert.get("severity","?"))
+        evt = str(alert.get("event_type","?"))
+        ts  = str(alert.get("threat_score") or 0)
+        bs  = str(alert.get("behavior_score") or 0)
+        vts = str(alert.get("vt_score") or 0)
+        raw = str(alert.get("raw_log",""))[:500]
+
+        ctx = (
+            f"INCIDENT #{alert.get('id','?')} | "
+            f"{str(alert.get('timestamp','?'))[:19]}\n"
+            f"Source IP: {ip} | Severity: {sev} | Status: {alert.get('status','?')}\n"
+            f"Event Type: {evt}\n"
+            f"Threat Score: {ts} | Behavior Score: {bs} | VT Score: {vts}\n"
+            f"Shodan/Enrich: {alert.get('enrich_summary','none')}\n"
+            f"Raw Log: {raw}"
+        )
+        label = (
+            f"#{alert.get('id','?')} — {evt}\n"
+            f"IP: {ip}\n"
+            f"Severity: {sev}  Score: {ts}"
+        )
+        return ctx, label
+
+    def _chat_update_ctx_label(self):
+        """Called on each timer tick to keep sidebar context label fresh."""
+        if not hasattr(self, "_chat_ctx_lbl"):
+            return
+        _, label = self._chat_get_incident_ctx()
+        self._chat_ctx_lbl.setText(
+            label if label else "No incident selected.\nSelect a row in\nLive Alerts tab.")
+
+    def _chat_quick(self, action_key):
+        ctx, _ = self._chat_get_incident_ctx()
+        no_sel = "No incident is selected. Please click a row in the **Live Alerts** tab first."
+
+        def _prompt():
+            if action_key == "shift_summary":
+                return self._chat_shift_summary()
+            if action_key == "analyze_selected":
+                return (f"{ctx}\n\nAnalyze this incident. What is happening, what is the "
+                        f"threat level, and what should I do next?") if ctx else no_sel
+            if action_key == "block_decision":
+                return (f"{ctx}\n\nShould I block this source IP? Give a structured "
+                        f"recommendation: Severity, Confidence, Recommended Action, Rationale."
+                        ) if ctx else no_sel
+            if action_key == "explain_log":
+                return (f"{ctx}\n\nExplain what this log entry means and what the attacker "
+                        f"is attempting to do.") if ctx else no_sel
+            if action_key == "suggest_rule":
+                return (f"{ctx}\n\nSuggest a detection rule for this attack pattern using "
+                        f"the Rule Engine v2 format (field / operator / value conditions, "
+                        f"AND or OR logic, recommended actions and cooldown).") if ctx else no_sel
+            if action_key == "mitre_map":
+                return (f"{ctx}\n\nMap this incident to MITRE ATT&CK. List relevant "
+                        f"technique IDs and names.") if ctx else no_sel
+            if action_key == "playbook_bruteforce":
+                return ("Give me a step-by-step response playbook for a brute force attack "
+                        "detected in SOC SIEM PRO. Include specific tab names and UI actions.")
+            if action_key == "playbook_c2":
+                return ("Give me a step-by-step response playbook for a C2 communication or "
+                        "beaconing detection. Include specific tab names and UI actions.")
+            if action_key == "playbook_portscan":
+                return ("Give me a step-by-step response playbook for a port scan detection. "
+                        "Include specific tab names and UI actions.")
+            if action_key == "playbook_ddos":
+                return ("Give me a step-by-step response playbook for a DDoS attack detection. "
+                        "Include specific tab names and UI actions.")
+            return None
+
+        msg = _prompt()
+        if not msg:
+            return
+        self._chat_history.append({"role": "user", "content": msg})
+        self._chat_render()
+        self._chat_call_ollama()
+
+    def _chat_shift_summary(self):
+        now    = datetime.now()
+        cutoff = now - timedelta(hours=8)
+        recent = [a for a in self._all_alerts
+                  if str(a.get("timestamp","")) >= cutoff.strftime("%Y-%m-%d %H:%M")]
+        if not recent:
+            return ("No incidents in the last 8 hours. "
+                    "Provide a brief all-clear shift handover note.")
+        sev_counts  = Counter(a.get("severity","?")    for a in recent)
+        type_counts = Counter(a.get("event_type","?")  for a in recent)
+        high_risk   = [a for a in recent if int(a.get("threat_score") or 0) >= 70]
+        blocked     = [a for a in recent if a.get("status") == "Blocked"]
+        unresolved  = [a for a in recent if a.get("status") not in
+                       ("Resolved","False Positive","Blocked")]
+        return (
+            f"SHIFT SUMMARY REQUEST — {now.strftime('%Y-%m-%d %H:%M')}\n"
+            f"Period: last 8 hours\n"
+            f"Total incidents: {len(recent)}\n"
+            f"Severity breakdown: {dict(sev_counts)}\n"
+            f"Top event types: {dict(type_counts.most_common(5))}\n"
+            f"High-threat incidents (score ≥ 70): {len(high_risk)}\n"
+            f"Auto-blocked IPs this shift: {len(blocked)}\n"
+            f"Unresolved incidents: {len(unresolved)}\n\n"
+            "Please write a structured shift handover brief. "
+            "Highlight critical items requiring immediate follow-up."
+        )
 
     def _on_action_taken(self, ip, action_str):
         self.lbl_action.setText(f"⚡ {action_str}  [{ip}]")
@@ -1783,24 +2306,21 @@ class SOCDashboard(QMainWindow):
                     self._ip_severity[ip] = sev
                 with self._geo_lock:
                     if ip not in self._geo_cache:
-                        threading.Thread(target=self.geolocate_ip, args=(ip,), daemon=True).start()
+                        self._bg_pool.submit(self.geolocate_ip, ip)
                 with self._threat_lock:
                     threat_missing = ip not in self._threat_cache
                 if threat_missing:
-                    threading.Thread(target=self._enrich_ip, args=(ip,), daemon=True).start()
+                    self._bg_pool.submit(self._enrich_ip, ip)
                 if alert.get("id") not in previous_ids and self.db_path:
-                    threading.Thread(
-                        target=self._run_rules,
-                        args=(
-                            ip, etype, sev,
-                            str(alert.get("category", "")),
-                            int(alert.get("threat_score") or 0),
-                            int(alert.get("behavior_score") or 0),
-                            int(alert.get("vt_score") or 0),
-                            float(alert.get("anomaly_score") or 0),
-                        ),
-                        daemon=True,
-                    ).start()
+                    self._bg_pool.submit(
+                        self._run_rules,
+                        ip, etype, sev,
+                        str(alert.get("category", "")),
+                        int(alert.get("threat_score") or 0),
+                        int(alert.get("behavior_score") or 0),
+                        int(alert.get("vt_score") or 0),
+                        float(alert.get("anomaly_score") or 0),
+                    )
 
             self._prev_ids = new_ids
             self.filter_table()
@@ -1811,6 +2331,7 @@ class SOCDashboard(QMainWindow):
             self._refresh_blocklist_tab()
             self._refresh_rules_tab()
             self._show_selected_alert_details()  # re-render if deepseek report arrived
+            self._chat_update_ctx_label()         # keep sidebar incident context fresh
 
         except Exception as e:
             print(f"!!! PROCESS ERROR: {e}")
@@ -1860,8 +2381,8 @@ class SOCDashboard(QMainWindow):
             search in str(a.get("event_type","")).lower() or
             search in str(a.get("severity","")).lower() or
             search in str(a.get("status","")).lower() or
-            search in geo_snap.get(str(a.get("source_ip","")),{}).get("country","").lower() or
-            search in score_to_label(threat_snap.get(str(a.get("source_ip","")),{}).get("abuse_score",-1))[0].lower()
+            search in (geo_snap.get(str(a.get("source_ip",""))) or {}).get("country","").lower() or
+            search in score_to_label((threat_snap.get(str(a.get("source_ip",""))) or {}).get("abuse_score",-1))[0].lower()
         ]
 
         self.table.clearContents(); self.table.setRowCount(len(filtered))
@@ -1871,9 +2392,9 @@ class SOCDashboard(QMainWindow):
             sev_val  = str(alert.get("severity","LOW"))
             ts_val   = str(alert.get("timestamp",""))[:19]
             status   = str(alert.get("status","Logged"))
-            country  = geo_snap.get(ip_val,{}).get("country","Detecting...")
+            country  = (geo_snap.get(ip_val) or {}).get("country","Detecting...")
             color    = SEV_COLORS.get(sev_val.upper(),"#ffffff")
-            t_info   = threat_snap.get(ip_val,{})
+            t_info   = threat_snap.get(ip_val) or {}
             stored   = int(alert.get("threat_score") or 0)
             ai_s     = int(alert.get("ai_score") or 0)
             abuse_s  = int(t_info.get("abuse_score") if t_info.get("abuse_score") is not None else -1)
@@ -2020,7 +2541,7 @@ class SOCDashboard(QMainWindow):
             with self._geo_lock:    geo_snap    = dict(self._geo_cache)
             with self._threat_lock: threat_snap = dict(self._threat_cache)
             for ip in self._all_ips:
-                geo = geo_snap.get(ip,{})
+                geo = geo_snap.get(ip) or {}
                 lat, lng = geo.get("lat",0), geo.get("lng",0)
                 if lat == 0 and lng == 0: continue
                 sev    = self._ip_severity.get(ip,"LOW")

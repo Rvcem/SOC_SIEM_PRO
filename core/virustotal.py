@@ -231,15 +231,14 @@ def vt_threat_score(vt_result: dict) -> int:
 
 def scan_log_sync(db_path: str, raw_log: str):
     """
-    Extract hashes and file paths from *raw_log*, check VT for each
+    Extract hashes from *raw_log*, check VT cache for each
     (cache-only for speed — no live API call here).
     Returns the worst-scoring cached result, or None if nothing is cached.
+
+    Note: file paths are NOT opened automatically from log content because
+    the raw_log originates from untrusted UDP packets and could be attacker-crafted.
     """
     candidates = list(extract_hashes(raw_log))
-    for path in extract_file_paths(raw_log):
-        h = hash_file(path)
-        if h:
-            candidates.append(h)
 
     worst, worst_score = None, -1
     for hash_type, hash_val in candidates:
@@ -252,12 +251,12 @@ def scan_log_sync(db_path: str, raw_log: str):
 
 
 def _live_scan(db_path: str, incident_id: int, raw_log: str):
-    """Background thread: perform live VT lookups and update the incident row."""
+    """Background thread: perform live VT lookups and update the incident row.
+
+    Only explicit hashes from the log are checked — local file paths are never
+    opened because raw_log comes from untrusted UDP packets.
+    """
     candidates = list(extract_hashes(raw_log))
-    for path in extract_file_paths(raw_log):
-        h = hash_file(path)
-        if h:
-            candidates.append(h)
 
     if not candidates:
         return

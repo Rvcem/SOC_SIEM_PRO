@@ -24,6 +24,39 @@ _dedup_cache     = {}
 _ip_event_counts = defaultdict(int)
 _ip_event_window = defaultdict(float)
 
+# ── UDP rate limiting (per source IP) ────────────────────────────────────────
+_UDP_RATE_LIMIT  = 200   # max packets per window per source IP
+_UDP_RATE_WINDOW = 60    # seconds
+_udp_counts      = defaultdict(int)
+_udp_windows     = defaultdict(float)
+
+# ── Periodic cache pruning ───────────────────────────────────────────────────
+_PRUNE_INTERVAL = 300    # prune every 5 minutes
+_last_prune     = 0.0
+
+
+def _prune_caches():
+    """Remove stale entries from in-memory caches to prevent unbounded growth."""
+    global _last_prune
+    now = time.time()
+    if now - _last_prune < _PRUNE_INTERVAL:
+        return
+    _last_prune = now
+    cutoff_dedup = now - DEDUP_WINDOW
+    stale_dedup  = [k for k, t in _dedup_cache.items() if t < cutoff_dedup]
+    for k in stale_dedup:
+        _dedup_cache.pop(k, None)
+    cutoff_rate = now - _UDP_RATE_WINDOW
+    stale_rate  = [k for k, t in _udp_windows.items() if t < cutoff_rate]
+    for k in stale_rate:
+        _udp_windows.pop(k, None)
+        _udp_counts.pop(k, None)
+    cutoff_ev   = now - 300
+    stale_ev    = [k for k, t in _ip_event_window.items() if t < cutoff_ev]
+    for k in stale_ev:
+        _ip_event_window.pop(k, None)
+        _ip_event_counts.pop(k, None)
+
 
 def _is_duplicate(ip, etype):
     key = (ip, etype)
@@ -57,6 +90,19 @@ def start_listener(host="0.0.0.0", port=5555):
         try:
             data, addr = sock.recvfrom(4096)
             raw_log = data.decode("utf-8", errors="ignore")
+
+            # ── Periodic cache pruning ────────────────────────────────────────
+            _prune_caches()
+
+            # ── Per-source-IP UDP rate limiting ───────────────────────────────
+            src_ip = addr[0]
+            now_rl = time.time()
+            if now_rl - _udp_windows[src_ip] > _UDP_RATE_WINDOW:
+                _udp_counts[src_ip]  = 0
+                _udp_windows[src_ip] = now_rl
+            _udp_counts[src_ip] += 1
+            if _udp_counts[src_ip] > _UDP_RATE_LIMIT:
+                continue  # drop silently — attacker flooding UDP port
 
             # ── IP extraction ─────────────────────────────────────────────────
             sip = extract_ip(raw_log)

@@ -19,6 +19,7 @@ Environment variables:
   VT_API_KEY          — already used by core/virustotal.py, reused here for URL/domain lookups
 """
 
+import ipaddress
 import os
 import re
 import sqlite3
@@ -114,6 +115,22 @@ _DOMAIN_RE = re.compile(
 _PRIVATE_RE = re.compile(
     r'^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0)'
 )
+
+
+def _is_private_url(url: str) -> bool:
+    """Return True if the URL's hostname resolves to a private/loopback IP literal."""
+    try:
+        host = urlparse(url).hostname or ""
+        try:
+            addr = ipaddress.ip_address(host)
+            return addr.is_private or addr.is_loopback or addr.is_link_local
+        except ValueError:
+            pass
+        if host.lower() in ("localhost", "localhost.localdomain"):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def extract_urls(log: str) -> list:
@@ -226,10 +243,9 @@ def _shodan_live_and_patch(db_path: str, incident_id: int, ip: str):
     try:
         with sqlite3.connect(db_path) as conn:
             conn.execute(
-                "UPDATE incidents SET shodan_score=?, shodan_ports=?, shodan_vulns=?,"
-                " enrich_summary=enrich_summary||? WHERE id=?",
-                (score, result["open_ports"], result["vulns"],
-                 f" | Shodan: {result['org']} {result['open_ports'][:60]}", incident_id)
+                "UPDATE incidents SET shodan_score=?, shodan_ports=?, shodan_vulns=?"
+                " WHERE id=?",
+                (score, result["open_ports"], result["vulns"], incident_id)
             )
             conn.commit()
         print(f"[SHODAN] incident {incident_id}: {ip} score={score}")
@@ -332,10 +348,9 @@ def _greynoise_live_and_patch(db_path: str, incident_id: int, ip: str):
     try:
         with sqlite3.connect(db_path) as conn:
             conn.execute(
-                "UPDATE incidents SET greynoise_score=?, greynoise_classification=?,"
-                " enrich_summary=enrich_summary||? WHERE id=?",
-                (score, label,
-                 f" | GreyNoise: {label}{noise_flag}{riot_flag}", incident_id)
+                "UPDATE incidents SET greynoise_score=?, greynoise_classification=?"
+                " WHERE id=?",
+                (score, label, incident_id)
             )
             conn.commit()
         print(f"[GREYNOISE] incident {incident_id}: {ip} {label} score={score}")
@@ -437,9 +452,8 @@ def _urlscan_live_and_patch(db_path: str, incident_id: int, urls: list):
         with sqlite3.connect(db_path) as conn:
             conn.execute(
                 "UPDATE incidents SET urlscan_score=?, urlscan_verdict=?,"
-                " urlscan_link=?, enrich_summary=enrich_summary||? WHERE id=?",
-                (worst_score, worst["verdict"], worst["report_url"],
-                 f" | URLScan: {worst['verdict'].upper()} ({worst_score})", incident_id)
+                " urlscan_link=? WHERE id=?",
+                (worst_score, worst["verdict"], worst["report_url"], incident_id)
             )
             conn.commit()
         print(f"[URLSCAN] incident {incident_id}: {worst['verdict']} score={worst_score}")
@@ -505,10 +519,12 @@ def _live_vt_url(target: str, is_url: bool) -> dict | None:
     global _last_vt_url_call
     if not VT_API_KEY:
         return None
+    # Compute wait time outside the lock so other threads aren't blocked during sleep
     with _vt_url_lock:
         wait = _VT_URL_INTERVAL - (time.time() - _last_vt_url_call)
-        if wait > 0:
-            time.sleep(wait)
+    if wait > 0:
+        time.sleep(wait)
+    with _vt_url_lock:
         _last_vt_url_call = time.time()
     try:
         import base64
@@ -560,10 +576,9 @@ def _vt_url_live_and_patch(db_path: str, incident_id: int, targets: list):
     try:
         with sqlite3.connect(db_path) as conn:
             conn.execute(
-                "UPDATE incidents SET vt_url_score=?, vt_url_link=?,"
-                " enrich_summary=enrich_summary||? WHERE id=?",
-                (worst_score, worst.get("vt_link",""),
-                 f" | VT URL: {worst_score}/100", incident_id)
+                "UPDATE incidents SET vt_url_score=?, vt_url_link=?"
+                " WHERE id=?",
+                (worst_score, worst.get("vt_link",""), incident_id)
             )
             conn.commit()
         print(f"[VT URL] incident {incident_id}: score={worst_score}")
@@ -612,12 +627,12 @@ def enrich_incident_async(
         enrich_greynoise_async(db_path, incident_id, source_ip)
 
     if et in _URLSCAN_EVENTS:
-        urls = extract_urls(raw_log)
+        urls = [u for u in extract_urls(raw_log) if not _is_private_url(u)]
         if urls:
             enrich_urlscan_async(db_path, incident_id, urls)
 
     if et in _VT_URL_EVENTS:
-        targets = [(u, True) for u in extract_urls(raw_log)]
+        targets = [(u, True) for u in extract_urls(raw_log) if not _is_private_url(u)]
         targets += [(d, False) for d in extract_domains(raw_log)
                     if not any(d in u for u, _ in targets)]
         if targets:

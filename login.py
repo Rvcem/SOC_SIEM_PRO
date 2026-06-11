@@ -1,6 +1,7 @@
 import sys
 import sqlite3
 import hashlib
+import hmac
 import os
 import secrets
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -121,7 +122,8 @@ def _legacy_sha256(password: str) -> str:
 
 
 def _verify_password(stored_hash: str, password: str) -> bool:
-    if stored_hash == _legacy_sha256(password):
+    # Constant-time comparison prevents timing oracle attacks on SHA-256 legacy hashes
+    if hmac.compare_digest(stored_hash, _legacy_sha256(password)):
         return True
     try:
         return check_password_hash(stored_hash, password)
@@ -456,8 +458,11 @@ class LoginWindow(QMainWindow):
         QTimer.singleShot(100, self._anim.start)
 
         self._fail_count = 0
+        self._locked = False
 
     def attempt_login(self):
+        if self._locked:
+            return
         username = self.inp_user.text().strip()
         password = self.inp_pass.text()
 
@@ -480,12 +485,27 @@ class LoginWindow(QMainWindow):
             QTimer.singleShot(800, lambda: self._open_dashboard(username, role))
         else:
             self._fail_count += 1
-            self._set_error(f"✕  ACCESS DENIED  [{self._fail_count} FAILED ATTEMPT{'S' if self._fail_count > 1 else ''}]")
+            # Permanent lockout after 10 consecutive failures
+            if self._fail_count >= 10:
+                self._locked = True
+                self._set_error("✕  ACCOUNT LOCKED — Restart the application")
+                self.btn_login.setText("LOCKED")
+                self.btn_login.setEnabled(False)
+                return
+            # Exponential backoff: 1s, 2s, 4s, 8s … capped at 30s
+            backoff_ms = min(1000 * (2 ** (self._fail_count - 1)), 30000)
+            self._set_error(
+                f"✕  ACCESS DENIED  [{self._fail_count} FAILED ATTEMPT{'S' if self._fail_count > 1 else ''}]"
+                f"  — retry in {backoff_ms // 1000}s"
+            )
             self.inp_pass.clear()
+            self._shake()
+            QTimer.singleShot(backoff_ms, self._unlock_button)
+
+    def _unlock_button(self):
+        if not self._locked:
             self.btn_login.setEnabled(True)
             self.btn_login.setText("AUTHENTICATE")
-            # Shake animation
-            self._shake()
 
     def _set_error(self, msg):
         self.lbl_feedback.setStyleSheet("color: #ff4757; font-family: 'Courier New'; font-size: 10px;")

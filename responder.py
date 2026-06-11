@@ -17,6 +17,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from urllib.parse import urlparse
 
 # ── Email Config (set via SettingsDialog, stored in DB) ───────────────────────
 
@@ -645,7 +646,13 @@ def _eval_condition(cond: dict, ctx: dict) -> bool:
         if op == "contains":
             return value.lower() in str(raw).lower()
         if op == "regex":
-            return bool(_re.search(value, str(raw), _re.I))
+            # Guard against ReDoS: reject patterns over 200 chars or invalid ones
+            if len(value) > 200:
+                return False
+            try:
+                return bool(_re.search(_re.compile(value, _re.I), str(raw)))
+            except _re.error:
+                return False
         if op == "in":
             items = [x.strip().lower() for x in value.split(",")]
             return str(raw).lower() in items
@@ -690,6 +697,42 @@ def _ip_excluded(ip: str, exclude_str: str) -> bool:
         pass
     return False
 
+# ── Webhook URL safety ─────────────────────────────────────────────────────────
+
+_PRIVATE_NETS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+]
+
+
+def _is_safe_webhook_url(url: str) -> bool:
+    """Reject loopback, RFC-1918, file:// and non-http(s) webhook targets."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        try:
+            addr = ipaddress.ip_address(host)
+            for net in _PRIVATE_NETS:
+                if addr in net:
+                    return False
+        except ValueError:
+            pass  # hostname — DNS not resolved here; block obvious loopback names
+        if host.lower() in ("localhost", "localhost.localdomain"):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 # ── Quarantine helper ─────────────────────────────────────────────────────────
 
 def _quarantine_ip(db_path: str, ip: str, event_type: str, rule_name: str):
@@ -718,6 +761,9 @@ def _escalate_incident(db_path: str, ip: str):
 
 
 def _call_webhook(url: str, payload: dict):
+    if not _is_safe_webhook_url(url):
+        print(f"[WEBHOOK] Blocked unsafe URL: {url[:80]}")
+        return
     try:
         import requests as _req
         _req.post(url, json=payload, timeout=5)
