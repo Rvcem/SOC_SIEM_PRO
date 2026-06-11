@@ -12,6 +12,7 @@ from core.detector import check_anomaly, detect_event, extract_ip
 from core.ai_analyzer import analyze_log
 from core.ollama_reporter import generate_report_async, init_reports_table
 from core.schema import ensure_incident_schema
+from core.threat_enrichment import enrich_incident_async
 from core.virustotal import scan_log_async, scan_log_sync
 from responder import block_ip, init_responder_tables
 from sandbox_integrations import extract_observables, init_sandbox_tables, submit_observable_async
@@ -146,6 +147,9 @@ def start_listener(host="0.0.0.0", port=5555):
 
             # ── Async VT live lookup (updates row when result arrives) ─────────
             scan_log_async("incidents.db", incident_id, raw_log)
+
+            # ── Threat enrichment (Shodan/GreyNoise/URLScan/VT-URL) ───────────
+            enrich_incident_async("incidents.db", incident_id, sip, etype, raw_log)
 
             # ── Ollama deep-analysis report (deepseek-coder-v2:16b) ───────────
             generate_report_async(

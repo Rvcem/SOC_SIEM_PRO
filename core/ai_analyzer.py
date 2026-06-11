@@ -159,6 +159,10 @@ def analyze_log(
     vt_score: int = 0,
     behavior_score: int = 0,
     behavior_alerts: list = None,
+    shodan_score: int = 0,
+    greynoise_score: int = 0,
+    urlscan_score: int = 0,
+    vt_url_score: int = 0,
 ) -> dict:
     heuristic = heuristic_log_score(raw_log, ip, event_type, severity)
     ollama    = ollama_log_score(raw_log, event_type, severity)
@@ -166,31 +170,51 @@ def analyze_log(
 
     combined = max(heuristic["score"], ai_score)
 
-    # Statistical anomaly escalation
     if anomaly_score > 2.5:
         combined = max(combined, 85)
 
-    # VirusTotal escalation — malicious file is strong signal
     if vt_score >= 70:
         combined = max(combined, vt_score)
     elif vt_score > 0:
-        combined = max(combined, combined + (vt_score // 4))
+        combined = min(100, combined + vt_score // 4)
 
-    # Behavioral analytics escalation
     if behavior_score > 0:
-        combined = max(combined, combined + (behavior_score // 3))
+        combined = min(100, combined + behavior_score // 3)
     if behavior_score >= 40:
         combined = max(combined, 80)
 
+    # Shodan: many open ports / known CVEs on the source IP
+    if shodan_score >= 50:
+        combined = max(combined, combined + shodan_score // 5)
+
+    # GreyNoise: confirmed malicious mass-scanner
+    if greynoise_score >= 80:
+        combined = max(combined, 85)
+    elif greynoise_score > 0:
+        combined = min(100, combined + greynoise_score // 6)
+
+    # URLScan: sandbox says URL is malicious
+    if urlscan_score >= 70:
+        combined = max(combined, urlscan_score)
+    elif urlscan_score > 0:
+        combined = min(100, combined + urlscan_score // 4)
+
+    # VT URL/domain lookup
+    if vt_url_score >= 70:
+        combined = max(combined, vt_url_score)
+    elif vt_url_score > 0:
+        combined = min(100, combined + vt_url_score // 4)
+
     combined = _clamp_score(combined)
 
-    # Build a rich summary
     base_summary = ollama["summary"] if ollama and ollama.get("summary") else heuristic["summary"]
     extra_parts = []
-    if vt_score > 0:
-        extra_parts.append(f"VT score: {vt_score}/100")
-    if behavior_alerts:
-        extra_parts.extend(behavior_alerts[:2])
+    if vt_score > 0:        extra_parts.append(f"VT file: {vt_score}/100")
+    if vt_url_score > 0:    extra_parts.append(f"VT URL: {vt_url_score}/100")
+    if shodan_score > 0:    extra_parts.append(f"Shodan: {shodan_score}/100")
+    if greynoise_score > 0: extra_parts.append(f"GreyNoise: {greynoise_score}/100")
+    if urlscan_score > 0:   extra_parts.append(f"URLScan: {urlscan_score}/100")
+    if behavior_alerts:     extra_parts.extend(behavior_alerts[:2])
     summary = "; ".join(filter(None, [base_summary] + extra_parts))[:600]
 
     return {

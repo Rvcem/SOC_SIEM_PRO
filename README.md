@@ -46,26 +46,30 @@ SOC-SIEM PRO blends statistical analysis, unsupervised learning, and stateful be
 
 ```text
 ├── backend/
-│   └── api.py                   # Flask Server: Administration endpoints (incidents, blocklists)
+│   └── api.py                    # Flask REST API (incidents, blocklist, rules endpoints)
 ├── core/
-│   ├── detector.py              # ML Engine (Isolation Forest) and signature parsing logic
-│   ├── ai_analyzer.py           # Heuristic assessment, threat profiling, and mitigation triggers
-│   ├── schema.py                # Database migrations and schema lifecycle management
-│   └── parser.py                # Syslog parsing and ingestion subsystem
+│   ├── ai_analyzer.py            # Heuristic + multi-source threat scoring, auto-block trigger
+│   ├── behavioral.py             # Sliding-window behavioral detectors (spray, beaconing, etc.)
+│   ├── detector.py               # Signature/regex matching + Isolation Forest anomaly scoring
+│   ├── ollama_reporter.py        # Ollama-powered per-incident report generator (async)
+│   ├── parser.py                 # Syslog parsing and IP extraction
+│   ├── pdf_report.py             # Three-stage PDF: DB collect → Ollama summary → fpdf2 layout
+│   ├── schema.py                 # Additive SQLite schema migrations
+│   ├── threat_enrichment.py      # Shodan / GreyNoise / URLScan / VT-URL enrichment (async)
+│   └── virustotal.py             # VirusTotal hash + URL lookups with 24h cache
 ├── gui/
-│   ├── app.py                   # Main View: PyQt6 SOC Management Interface (SOCDashboard)
-│   └── tests/
-│       └── test_regressions.py  # Unit verification and regression testing suites
-├── core/
-│   ├── ollama_reporter.py       # Ollama-powered incident report generator (background, non-blocking)
-│   ├── virustotal.py            # VirusTotal hash intelligence integration
-│   └── behavioral.py           # Behavioral heuristics and pattern analysis
-├── threat_intel.py              # AbuseIPDB API orchestration and local caching layer (24h)
-├── responder.py                 # SOAR workflow management (Rules, Notification routing, Blocklists)
-├── sandbox_integrations.py      # Asynchronous artifact submission pipelines (Cuckoo/Litterbox)
-├── siem_listener.py             # Standalone production UDP syslog ingestion service
-├── start.py                     # Monolithic startup orchestration (UDP Ingestion + Flask API + PyQt6 GUI)
-└── test_siem.py                 # Multi-vector adversarial emulation and attack simulator
+│   └── app.py                    # PyQt6 SOCDashboard — all tabs, rule builder, PDF export
+├── tests/
+│   └── test_regressions.py       # Regression test suite
+├── login.py                      # Login window (PasswordLineEdit with eye toggle, PBKDF2 auth)
+├── responder.py                  # Rule engine v2: conditions, cooldown, multi-action SOAR
+├── sandbox_integrations.py       # Cuckoo / Litterbox artifact submission pipelines
+├── siem_listener.py              # UDP port 5555 ingestion and full detection pipeline
+├── start.py                      # Startup: UDP listener + Flask API + GUI on three threads
+├── test_siem.py                  # Multi-vector attack simulator
+├── threat_intel.py               # AbuseIPDB integration and local cache
+├── .env.example                  # Environment variable template
+└── ENVIRONMENT_SETUP.md          # Detailed API key setup guide
 ```
 
 ## Run
@@ -98,10 +102,15 @@ python start.py
 This starts the UDP listener, Flask API, login screen, and dashboard together.
 
 ### 4. Login
-```bash
-username : admin
-password : admin123
+
+On first run, if `SOC_ADMIN_PASSWORD` is not set in `.env`, a one-time admin password is auto-generated and printed to the console:
+
 ```
+[AUTH] Created first admin user: admin
+[AUTH] One-time admin password: <random>
+```
+
+Use `admin` as the username and that printed password. To set a fixed password, add `SOC_ADMIN_PASSWORD=yourpassword` to `.env` before first run.
 
 ### 5. Send Demo Events
 ```bash

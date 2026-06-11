@@ -5,16 +5,28 @@ from responder import init_rules_v2_table
 
 
 INCIDENT_COLUMNS = {
-    "raw_log":          "TEXT",
-    "anomaly_score":    "REAL DEFAULT 0",
-    "threat_score":     "INTEGER DEFAULT 0",
-    "ai_score":         "INTEGER DEFAULT 0",
-    "ai_summary":       "TEXT DEFAULT ''",
-    "vt_score":         "INTEGER DEFAULT 0",
-    "vt_hash":          "TEXT DEFAULT ''",
-    "vt_link":          "TEXT DEFAULT ''",
-    "behavior_score":   "INTEGER DEFAULT 0",
-    "behavior_alerts":  "TEXT DEFAULT ''",
+    "raw_log":                  "TEXT",
+    "anomaly_score":            "REAL DEFAULT 0",
+    "threat_score":             "INTEGER DEFAULT 0",
+    "ai_score":                 "INTEGER DEFAULT 0",
+    "ai_summary":               "TEXT DEFAULT ''",
+    "vt_score":                 "INTEGER DEFAULT 0",
+    "vt_hash":                  "TEXT DEFAULT ''",
+    "vt_link":                  "TEXT DEFAULT ''",
+    "behavior_score":           "INTEGER DEFAULT 0",
+    "behavior_alerts":          "TEXT DEFAULT ''",
+    # Enrichment columns
+    "shodan_score":             "INTEGER DEFAULT 0",
+    "shodan_ports":             "TEXT DEFAULT ''",
+    "shodan_vulns":             "TEXT DEFAULT ''",
+    "greynoise_score":          "INTEGER DEFAULT 0",
+    "greynoise_classification": "TEXT DEFAULT ''",
+    "urlscan_score":            "INTEGER DEFAULT 0",
+    "urlscan_verdict":          "TEXT DEFAULT ''",
+    "urlscan_link":             "TEXT DEFAULT ''",
+    "vt_url_score":             "INTEGER DEFAULT 0",
+    "vt_url_link":              "TEXT DEFAULT ''",
+    "enrich_summary":           "TEXT DEFAULT ''",
 }
 
 
@@ -35,6 +47,8 @@ def ensure_incident_schema(db_path: str):
         conn.close()
     init_vt_table(db_path)
     init_rules_v2_table(db_path)
+    from core.threat_enrichment import init_enrichment_tables
+    init_enrichment_tables(db_path)
 
 
 def get_app_config(db_path: str, key: str, default=None):

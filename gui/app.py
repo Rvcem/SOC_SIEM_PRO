@@ -9,6 +9,7 @@ from datetime import datetime
 import ipaddress
 from core.schema import get_app_config, set_app_config
 from core.ollama_reporter import get_recent_reports, generate_report_async
+from core.pdf_report import generate_pdf
 from threat_intel import get_threat_score_async, score_to_label
 from responder import (
     init_responder_tables, load_email_config, save_email_config,
@@ -25,31 +26,87 @@ except ImportError:
 
 STYLE_SOC = """
     QMainWindow { background-color: #0b0b1a; }
+    QWidget { font-family: 'Segoe UI'; }
     QFrame#Card { background-color: #161633; border: 1px solid #2e2e66; border-radius: 10px; }
-    QLabel { color: #ffffff; font-family: 'Segoe UI'; }
-    QPushButton { background-color: #6c5ce7; color: white; border-radius: 7px; padding: 5px 12px; font-weight: bold; font-size: 11px; }
+    QLabel { color: #ffffff; font-family: 'Segoe UI'; font-size: 13px; }
+
+    QPushButton {
+        background-color: #6c5ce7; color: white; border-radius: 7px;
+        padding: 8px 18px; font-weight: bold; font-size: 12px; min-height: 32px;
+    }
+    QPushButton:hover { background-color: #7d6ff0; }
+    QPushButton:pressed { background-color: #5a4dd4; }
     QPushButton#danger { background-color: #ff4757; }
+    QPushButton#danger:hover { background-color: #ff6b7a; }
     QPushButton#success { background-color: #00b894; }
-    QTableWidget { background-color: #161633; color: white; border: none; gridline-color: #2e2e66; alternate-background-color: #1a1a3a; }
+    QPushButton#success:hover { background-color: #00d4aa; }
+
+    QTableWidget {
+        background-color: #161633; color: white; border: none;
+        gridline-color: #2e2e66; alternate-background-color: #1a1a3a; font-size: 12px;
+    }
+    QTableWidget::item { padding: 4px 6px; min-height: 28px; }
+    QTableWidget::item:hover { background-color: #222250; }
     QTableWidget::item:selected { background-color: #3a3a7a; color: #ffffff; }
     QTableWidget::item:selected:active { background-color: #4a4ab0; color: #ffffff; }
-    QHeaderView::section { background-color: #1c1c44; color: #00f2ff; padding: 4px; font-size: 11px; }
-    QLineEdit { background-color: #1c1c44; color: white; border: 1px solid #2e2e66; border-radius: 5px; padding: 4px; }
+
+    QHeaderView::section {
+        background-color: #1c1c44; color: #00f2ff; padding: 8px 6px;
+        font-size: 12px; font-weight: bold; border: none; border-right: 1px solid #2e2e66;
+    }
+    QHeaderView::section:hover { background-color: #252565; color: #ffffff; }
+
+    QLineEdit {
+        background-color: #1c1c44; color: white; border: 1px solid #2e2e66;
+        border-radius: 5px; padding: 7px 10px; min-height: 28px; font-size: 12px;
+    }
+    QLineEdit:hover { border: 1px solid #4a4a9a; }
+    QLineEdit:focus { border: 1px solid #6c5ce7; }
+
     QTabWidget::pane { border: 1px solid #2e2e66; background-color: #0b0b1a; }
-    QTabBar::tab { background-color: #161633; color: #aaaaaa; padding: 6px 14px; border-radius: 5px; margin: 2px; font-size: 11px; }
+    QTabBar::tab {
+        background-color: #161633; color: #aaaaaa; padding: 9px 18px;
+        border-radius: 5px; margin: 2px; font-size: 12px; min-height: 16px;
+    }
+    QTabBar::tab:hover { background-color: #1e1e55; color: #cccccc; }
     QTabBar::tab:selected { background-color: #6c5ce7; color: white; }
-    QSpinBox { background-color: #1c1c44; color: white; border: 1px solid #2e2e66; border-radius: 5px; padding: 3px; }
-    QComboBox { background-color: #1c1c44; color: white; border: 1px solid #2e2e66; border-radius: 5px; padding: 4px; }
+
+    QSpinBox {
+        background-color: #1c1c44; color: white; border: 1px solid #2e2e66;
+        border-radius: 5px; padding: 6px 8px; min-height: 28px; font-size: 12px;
+    }
+    QComboBox {
+        background-color: #1c1c44; color: white; border: 1px solid #2e2e66;
+        border-radius: 5px; padding: 6px 10px; min-height: 28px; font-size: 12px;
+    }
+    QComboBox:hover { border: 1px solid #4a4a9a; }
     QComboBox::drop-down { border: none; }
-    QComboBox QAbstractItemView { background-color: #161633; color: white; selection-background-color: #6c5ce7; }
-    QMenu { background-color: #161633; color: white; border: 1px solid #2e2e66; }
+    QComboBox QAbstractItemView {
+        background-color: #161633; color: white;
+        selection-background-color: #6c5ce7; font-size: 12px;
+    }
+
+    QMenu { background-color: #161633; color: white; border: 1px solid #2e2e66; font-size: 12px; padding: 4px 0px; }
+    QMenu::item { padding: 6px 20px; }
     QMenu::item:selected { background-color: #6c5ce7; }
-    QCheckBox { color: white; }
-    QScrollBar:vertical { background: #0b0b1a; width: 6px; border-radius: 3px; }
-    QScrollBar::handle:vertical { background: #2e2e66; border-radius: 3px; }
-    QScrollBar:horizontal { background: #0b0b1a; height: 6px; border-radius: 3px; }
-    QScrollBar::handle:horizontal { background: #6c5ce7; border-radius: 3px; }
+
+    QCheckBox { color: white; font-size: 12px; spacing: 6px; }
+    QCheckBox:hover { color: #a29bfe; }
+
+    QScrollBar:vertical { background: #0b0b1a; width: 10px; border-radius: 5px; }
+    QScrollBar::handle:vertical { background: #3a3a7a; border-radius: 5px; min-height: 30px; }
+    QScrollBar::handle:vertical:hover { background: #6c5ce7; }
+    QScrollBar:horizontal { background: #0b0b1a; height: 10px; border-radius: 5px; }
+    QScrollBar::handle:horizontal { background: #6c5ce7; border-radius: 5px; min-width: 30px; }
+    QScrollBar::handle:horizontal:hover { background: #7d6ff0; }
     QScrollBar::add-line, QScrollBar::sub-line { width: 0px; height: 0px; }
+
+    QSplitter::handle { background-color: #2e2e66; border-radius: 2px; }
+    QSplitter::handle:hover { background-color: #6c5ce7; }
+    QSplitter::handle:horizontal { width: 5px; }
+    QSplitter::handle:vertical { height: 5px; }
+
+    QTextEdit { font-size: 12px; }
 """
 
 SEV_COLORS = {"CRITICAL": "#ff0000", "HIGH": "#ff4757", "MEDIUM": "#ffa502", "LOW": "#00ff88"}
@@ -83,7 +140,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setStyleSheet(STYLE_SOC)
-        self.setFixedSize(460, 460)
+        self.setMinimumSize(520, 500)
         self.settings = settings or {}
         self.db_path  = db_path
         layout = QVBoxLayout(self)
@@ -118,10 +175,11 @@ class SettingsDialog(QDialog):
         self.inp_recip   = QLineEdit(email_cfg.get("recipient", ""))
         self.inp_recip.setPlaceholderText("alerts-recipient@email.com")
         lbl_help = QLabel("⚠ Use a Gmail App Password, not your account password.\nGet one at: myaccount.google.com → Security → App Passwords")
-        lbl_help.setStyleSheet("color: #ffa502; font-size: 10px;")
+        lbl_help.setStyleSheet("color: #ffa502; font-size: 12px;")
         lbl_help.setWordWrap(True)
         self.btn_test = QPushButton("SEND TEST EMAIL")
         self.btn_test.setObjectName("success")
+        self.btn_test.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_test.clicked.connect(self.test_email)
         ef.addRow(self.chk_email)
         ef.addRow(QLabel("From (Gmail):"),    self.inp_sender)
@@ -136,6 +194,8 @@ class SettingsDialog(QDialog):
         btn_save   = QPushButton("SAVE")
         btn_cancel = QPushButton("CANCEL")
         btn_cancel.setStyleSheet("background-color: #444;")
+        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save.clicked.connect(self.accept)
         btn_cancel.clicked.connect(self.reject)
         btns.addWidget(btn_save); btns.addWidget(btn_cancel)
@@ -194,23 +254,24 @@ class ConditionRow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 2, 0, 2)
-        lay.setSpacing(6)
+        lay.setContentsMargins(0, 4, 0, 4)
+        lay.setSpacing(8)
 
         self.cmb_field = QComboBox()
         self.cmb_field.addItems(self._FIELDS)
-        self.cmb_field.setFixedWidth(130)
+        self.cmb_field.setMinimumWidth(155)
         self.cmb_field.currentTextChanged.connect(self._update_ops)
 
         self.cmb_op = QComboBox()
-        self.cmb_op.setFixedWidth(100)
+        self.cmb_op.setMinimumWidth(120)
 
         self.inp_value = QLineEdit()
         self.inp_value.setPlaceholderText("value…")
 
         btn_rm = QPushButton("×")
-        btn_rm.setFixedWidth(28)
+        btn_rm.setFixedWidth(32)
         btn_rm.setStyleSheet("background:#c0392b; color:white; font-weight:bold; border-radius:4px;")
+        btn_rm.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_rm.clicked.connect(lambda: self.removed.emit(self))
 
         lay.addWidget(self.cmb_field)
@@ -261,7 +322,7 @@ class RuleBuilderDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("New Rule" if rule is None else f"Edit Rule — {rule.get('name','')}")
         self.setStyleSheet(STYLE_SOC)
-        self.setMinimumSize(700, 620)
+        self.setMinimumSize(820, 700)
         self._cond_rows = []
 
         outer = QVBoxLayout(self)
@@ -276,7 +337,7 @@ class RuleBuilderDialog(QDialog):
         # ── Name / Description / Priority ─────────────────────────────────────
         meta = QFrame(); meta.setObjectName("Card")
         mf = QFormLayout(meta)
-        mf.setContentsMargins(10, 8, 10, 8)
+        mf.setContentsMargins(14, 12, 14, 12)
         self.inp_name = QLineEdit()
         self.inp_desc = QLineEdit()
         self.spn_prio = QSpinBox(); self.spn_prio.setRange(1, 999); self.spn_prio.setValue(50)
@@ -290,29 +351,30 @@ class RuleBuilderDialog(QDialog):
         # ── Conditions ────────────────────────────────────────────────────────
         cond_frame = QFrame(); cond_frame.setObjectName("Card")
         cf = QVBoxLayout(cond_frame)
-        cf.setContentsMargins(10, 8, 10, 8)
+        cf.setContentsMargins(14, 12, 14, 12)
         ch = QHBoxLayout()
         lbl_c = QLabel("CONDITIONS")
-        lbl_c.setStyleSheet("color:#00f2ff; font-weight:bold; letter-spacing:1px;")
+        lbl_c.setStyleSheet("color:#00f2ff; font-weight:bold; letter-spacing:1px; font-size:13px;")
         lbl_mode = QLabel("Match:")
         self.cmb_mode = QComboBox(); self.cmb_mode.addItems(["AND", "OR"]); self.cmb_mode.setFixedWidth(60)
         btn_add_c = QPushButton("+ Add Condition")
         btn_add_c.setObjectName("success")
         btn_add_c.setFixedWidth(140)
+        btn_add_c.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_add_c.clicked.connect(self._add_row)
         ch.addWidget(lbl_c); ch.addSpacing(10)
         ch.addWidget(lbl_mode); ch.addWidget(self.cmb_mode)
         ch.addStretch(); ch.addWidget(btn_add_c)
         cf.addLayout(ch)
         self.cond_layout = QVBoxLayout()
-        self.cond_layout.setSpacing(2)
+        self.cond_layout.setSpacing(6)
         cf.addLayout(self.cond_layout)
         lay.addWidget(cond_frame)
 
         # ── Threshold / Window / Scope ────────────────────────────────────────
         tw = QFrame(); tw.setObjectName("Card")
         twf = QHBoxLayout(tw)
-        twf.setContentsMargins(10, 8, 10, 8)
+        twf.setContentsMargins(14, 12, 14, 12)
         self.spn_thr = QSpinBox(); self.spn_thr.setRange(1, 9999); self.spn_thr.setValue(1)
         self.spn_win = QSpinBox(); self.spn_win.setRange(0, 86400); self.spn_win.setSuffix(" s"); self.spn_win.setValue(60)
         self.cmb_scope = QComboBox(); self.cmb_scope.addItems(["per_ip", "global"])
@@ -326,9 +388,9 @@ class RuleBuilderDialog(QDialog):
         # ── Actions ───────────────────────────────────────────────────────────
         act_frame = QFrame(); act_frame.setObjectName("Card")
         af = QVBoxLayout(act_frame)
-        af.setContentsMargins(10, 8, 10, 8)
+        af.setContentsMargins(14, 12, 14, 12)
         lbl_act = QLabel("ACTIONS  (select one or more)")
-        lbl_act.setStyleSheet("color:#00f2ff; font-weight:bold; letter-spacing:1px;")
+        lbl_act.setStyleSheet("color:#00f2ff; font-weight:bold; letter-spacing:1px; font-size:13px;")
         af.addWidget(lbl_act)
         act_row = QHBoxLayout()
         self.chk_block = QCheckBox("🚫 Block IP")
@@ -350,7 +412,7 @@ class RuleBuilderDialog(QDialog):
         # ── Exclude IPs ───────────────────────────────────────────────────────
         excl = QFrame(); excl.setObjectName("Card")
         ef = QHBoxLayout(excl)
-        ef.setContentsMargins(10, 8, 10, 8)
+        ef.setContentsMargins(14, 12, 14, 12)
         ef.addWidget(QLabel("Exclude IPs / CIDRs:"))
         self.inp_excl = QLineEdit()
         self.inp_excl.setPlaceholderText("10.0.0.0/8, 192.168.0.0/16")
@@ -364,6 +426,8 @@ class RuleBuilderDialog(QDialog):
         btns = QHBoxLayout()
         btn_save   = QPushButton("SAVE RULE"); btn_save.setObjectName("success")
         btn_cancel = QPushButton("CANCEL");    btn_cancel.setStyleSheet("background:#444;")
+        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save.clicked.connect(self._on_save)
         btn_cancel.clicked.connect(self.reject)
         btns.addStretch(); btns.addWidget(btn_save); btns.addWidget(btn_cancel)
@@ -531,22 +595,24 @@ class SOCDashboard(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
-        layout.setSpacing(4)
-        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 10, 10, 10)
 
         # ── Header ───────────────────────────────────────────────────────────
         header = QHBoxLayout()
         header.setSpacing(10)
         lbl_title = QLabel("SOC MONITORING ENGINE")
-        lbl_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #00f2ff; letter-spacing: 2px;")
+        lbl_title.setStyleSheet("font-size: 20px; font-weight: bold; color: #00f2ff; letter-spacing: 2px;")
         lbl_user  = QLabel(f"👤 {self.username.upper()}  |  {self.role.upper()}")
-        lbl_user.setStyleSheet("font-size: 11px; color: #6c5ce7; font-family: 'Courier New';")
+        lbl_user.setStyleSheet("font-size: 13px; color: #6c5ce7; font-family: 'Courier New';")
         self.lbl_action = QLabel("")
-        self.lbl_action.setStyleSheet("font-size: 10px; color: #00ff88; font-family: 'Courier New';")
+        self.lbl_action.setStyleSheet("font-size: 12px; color: #00ff88; font-family: 'Courier New';")
         self.btn_settings = QPushButton("SETTINGS")
         self.btn_settings.setStyleSheet("background-color: #2e2e66;")
+        self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_settings.clicked.connect(self.open_settings)
         self.btn_report = QPushButton("EXPORT PDF")
+        self.btn_report.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_report.clicked.connect(self.generate_pdf_report)
         header.addWidget(lbl_title)
         header.addWidget(lbl_user)
@@ -559,14 +625,14 @@ class SOCDashboard(QMainWindow):
         # ── Stats bar ────────────────────────────────────────────────────────
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setFixedHeight(84)
+        scroll_area.setFixedHeight(110)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         scroll_widget = QWidget(); scroll_widget.setStyleSheet("background: transparent;")
         self.stats_bar = QHBoxLayout(scroll_widget)
-        self.stats_bar.setSpacing(6)
-        self.stats_bar.setContentsMargins(2, 2, 2, 2)
+        self.stats_bar.setSpacing(8)
+        self.stats_bar.setContentsMargins(4, 4, 4, 4)
         self.card_total, self.lbl_total = self._make_stat_card("TOTAL ALERTS", "0", "#00f2ff")
         self.stats_bar.addWidget(self.card_total)
         self.event_type_labels = {}
@@ -595,72 +661,78 @@ class SOCDashboard(QMainWindow):
 
     def _build_tab_alerts(self):
         sh = _screen_h()
-        map_h     = max(160, int(sh * 0.18))   # ~194px on 1080p
+        map_h     = max(260, int(sh * 0.29))   # ~313px on 1080p — bigger map
         details_h = max(220, int(sh * 0.30))   # ~324px on 1080p
 
         tab = QWidget(); tl = QVBoxLayout(tab)
-        tl.setContentsMargins(4, 4, 4, 4)
-        tl.setSpacing(4)
+        tl.setContentsMargins(8, 8, 8, 8)
+        tl.setSpacing(8)
         self.alert_splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # ── Left panel: trend graph + map ────────────────────────────────────
         left_widget = QWidget(); left = QVBoxLayout(left_widget)
         left.setContentsMargins(0, 0, 4, 0)
-        left.setSpacing(4)
+        left.setSpacing(8)
 
         self.graph_card = QFrame(); self.graph_card.setObjectName("Card")
         gv = QVBoxLayout(self.graph_card)
         gv.setContentsMargins(8, 6, 8, 6)
         gv.setSpacing(4)
         lbl_trend = QLabel("INCIDENT TREND (LIVE)")
-        lbl_trend.setStyleSheet("font-size: 10px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
+        lbl_trend.setStyleSheet("font-size: 13px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
         gv.addWidget(lbl_trend)
         self.graph_widget = pg.PlotWidget(); self.graph_widget.setBackground("#161633")
         self.curve = self.graph_widget.plot(pen=pg.mkPen(color="#00f2ff", width=2))
         gv.addWidget(self.graph_widget)
-        left.addWidget(self.graph_card, 1)
+        self.graph_widget.setMinimumHeight(160)
+        left.addWidget(self.graph_card, 1)   # equal 1:1 with map
 
         self.map_card = QFrame(); self.map_card.setObjectName("Card")
         mv = QVBoxLayout(self.map_card)
         mv.setContentsMargins(8, 6, 8, 6)
-        mv.setSpacing(4)
+        mv.setSpacing(6)
         mh = QHBoxLayout()
         lbl_map = QLabel("LIVE ATTACK MAP")
-        lbl_map.setStyleSheet("font-size: 10px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
+        lbl_map.setStyleSheet("font-size: 13px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
         self.btn_refresh_map = QPushButton("REFRESH MAP"); self.btn_refresh_map.setFixedWidth(110)
+        self.btn_refresh_map.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_refresh_map.clicked.connect(self.update_world_map)
         mh.addWidget(lbl_map); mh.addStretch(); mh.addWidget(self.btn_refresh_map)
         mv.addLayout(mh)
         self.web_view = QWebEngineView()
-        self.web_view.setFixedHeight(map_h)
+        self.web_view.setMinimumHeight(160)
         mv.addWidget(self.web_view)
-        left.addWidget(self.map_card)
+        left.addWidget(self.map_card, 1)     # equal 1:1 with trend
 
         # ── Right panel: risk + search + table + details ──────────────────────
         right_widget = QWidget(); right = QVBoxLayout(right_widget)
         right.setContentsMargins(4, 0, 0, 0)
-        right.setSpacing(4)
+        right.setSpacing(8)
 
         self.risk_card = QFrame(); self.risk_card.setObjectName("Card")
-        self.risk_card.setFixedHeight(72)
+        self.risk_card.setFixedHeight(88)
         rv = QHBoxLayout(self.risk_card)
-        rv.setContentsMargins(16, 4, 16, 4)
+        rv.setContentsMargins(20, 8, 20, 8)
         lbl_risk_title = QLabel("CURRENT RISK LEVEL")
-        lbl_risk_title.setStyleSheet("font-size: 10px; color: #888; letter-spacing: 1px;")
+        lbl_risk_title.setStyleSheet("font-size: 12px; color: #888; letter-spacing: 1px;")
         self.lbl_risk = QLabel("NORMAL")
-        self.lbl_risk.setStyleSheet("font-size: 26px; color: #00ff88; font-weight: bold;")
+        self.lbl_risk.setStyleSheet("font-size: 30px; color: #00ff88; font-weight: bold;")
         rv.addWidget(lbl_risk_title)
         rv.addStretch()
         rv.addWidget(self.lbl_risk)
         right.addWidget(self.risk_card)
 
         tools = QHBoxLayout()
-        tools.setSpacing(6)
+        tools.setSpacing(8)
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Search by IP, country, event, severity, threat...")
         self.search_bar.textChanged.connect(self.filter_table)
-        btn_zoom_out = QPushButton("−"); btn_zoom_out.setFixedWidth(30)
-        btn_zoom_in  = QPushButton("+"); btn_zoom_in.setFixedWidth(30)
+        btn_zoom_out = QPushButton("A−"); btn_zoom_out.setFixedWidth(48)
+        btn_zoom_in  = QPushButton("A+"); btn_zoom_in.setFixedWidth(48)
+        btn_zoom_out.setToolTip("Decrease table font size")
+        btn_zoom_in.setToolTip("Increase table font size")
+        btn_zoom_out.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_zoom_in.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_zoom_out.clicked.connect(lambda: self._set_zoom(self.gui_zoom - 1))
         btn_zoom_in.clicked.connect(lambda: self._set_zoom(self.gui_zoom + 1))
         tools.addWidget(self.search_bar)
@@ -670,26 +742,37 @@ class SOCDashboard(QMainWindow):
 
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(["Timestamp","Source IP","Country","Type","Severity","Threat Score","Status"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        ah = self.table.horizontalHeader()
+        ah.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        ah.setMinimumSectionSize(50)
+        self.table.setColumnWidth(0, 140)  # Timestamp
+        self.table.setColumnWidth(1, 115)  # Source IP
+        self.table.setColumnWidth(2, 90)   # Country
+        self.table.setColumnWidth(3, 160)  # Type
+        self.table.setColumnWidth(4, 80)   # Severity
+        self.table.setColumnWidth(5, 95)   # Threat Score
+        self.table.setColumnWidth(6, 80)   # Status
+        ah.setStretchLastSection(True)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_status_menu)
         self.table.itemSelectionChanged.connect(self._show_selected_alert_details)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         right.addWidget(self.table, 1)
+        self.table.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
 
         self.details_card = QFrame(); self.details_card.setObjectName("Card")
         dv = QVBoxLayout(self.details_card)
         dv.setContentsMargins(8, 6, 8, 6)
         dv.setSpacing(4)
         lbl_det = QLabel("FULL INCIDENT REPORT")
-        lbl_det.setStyleSheet("font-size: 10px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
+        lbl_det.setStyleSheet("font-size: 13px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
         dv.addWidget(lbl_det)
         self.detail_text = QTextEdit()
         self.detail_text.setReadOnly(True)
         self.detail_text.setFixedHeight(details_h)
         self.detail_text.setStyleSheet(
             "background-color:#0a0a1e; color:#ffffff; border:1px solid #2e2e66;"
-            "font-family:'Consolas'; font-size:11px;"
+            "font-family:'Consolas'; font-size:12px;"
         )
         dv.addWidget(self.detail_text)
         right.addWidget(self.details_card)
@@ -708,17 +791,17 @@ class SOCDashboard(QMainWindow):
         tbl_h   = max(110, int(sh * 0.12))   # ~129px on 1080p
 
         tab = QWidget(); tl = QVBoxLayout(tab)
-        tl.setContentsMargins(4, 4, 4, 4)
-        tl.setSpacing(6)
+        tl.setContentsMargins(8, 8, 8, 8)
+        tl.setSpacing(8)
 
         # ── Top row: pie + severity bar ───────────────────────────────────────
-        top_row = QHBoxLayout(); top_row.setSpacing(6)
+        top_row = QHBoxLayout(); top_row.setSpacing(8)
 
         pie_card = QFrame(); pie_card.setObjectName("Card")
         pie_vl = QVBoxLayout(pie_card)
         pie_vl.setContentsMargins(8, 6, 8, 6)
         pie_title = QLabel("EVENT TYPE DISTRIBUTION")
-        pie_title.setStyleSheet("color:#00f2ff; font-size:10px; font-weight:bold; letter-spacing:2px;")
+        pie_title.setStyleSheet("color:#00f2ff; font-size:13px; font-weight:bold; letter-spacing:2px;")
         pie_vl.addWidget(pie_title)
         self.pie_widget = pg.PlotWidget()
         self.pie_widget.setBackground("#161633")
@@ -732,7 +815,7 @@ class SOCDashboard(QMainWindow):
         sev_vl = QVBoxLayout(sev_card)
         sev_vl.setContentsMargins(8, 6, 8, 6)
         sev_title = QLabel("SEVERITY BREAKDOWN")
-        sev_title.setStyleSheet("color:#00f2ff; font-size:10px; font-weight:bold; letter-spacing:2px;")
+        sev_title.setStyleSheet("color:#00f2ff; font-size:13px; font-weight:bold; letter-spacing:2px;")
         sev_vl.addWidget(sev_title)
         self.sev_widget = pg.PlotWidget()
         self.sev_widget.setBackground("#161633")
@@ -747,7 +830,7 @@ class SOCDashboard(QMainWindow):
         heat_vl = QVBoxLayout(heat_card)
         heat_vl.setContentsMargins(8, 6, 8, 6)
         heat_title = QLabel("ATTACK HEATMAP — DAY × HOUR")
-        heat_title.setStyleSheet("color:#00f2ff; font-size:10px; font-weight:bold; letter-spacing:2px;")
+        heat_title.setStyleSheet("color:#00f2ff; font-size:13px; font-weight:bold; letter-spacing:2px;")
         heat_vl.addWidget(heat_title)
         self.heat_widget = pg.PlotWidget()
         self.heat_widget.setBackground("#161633")
@@ -762,7 +845,7 @@ class SOCDashboard(QMainWindow):
         tbl_vl = QVBoxLayout(tbl_card)
         tbl_vl.setContentsMargins(8, 6, 8, 6)
         tbl_lbl = QLabel("DETAILED EVENT BREAKDOWN")
-        tbl_lbl.setStyleSheet("color:#00f2ff; font-size:10px; font-weight:bold; letter-spacing:2px;")
+        tbl_lbl.setStyleSheet("color:#00f2ff; font-size:13px; font-weight:bold; letter-spacing:2px;")
         tbl_vl.addWidget(tbl_lbl)
         self.stats_table = QTableWidget(0, 3)
         self.stats_table.setHorizontalHeaderLabels(["Event Type", "Count", "% of Total"])
@@ -775,9 +858,9 @@ class SOCDashboard(QMainWindow):
 
     def _build_tab_timeline(self):
         tab = QWidget(); tl = QVBoxLayout(tab)
-        tl.setContentsMargins(4, 4, 4, 4)
+        tl.setContentsMargins(8, 8, 8, 8)
         lbl = QLabel("INCIDENTS PER HOUR (LAST 24H)")
-        lbl.setStyleSheet("font-size: 10px; color: #00f2ff; font-weight: bold; letter-spacing: 2px;")
+        lbl.setStyleSheet("font-size: 13px; color: #00f2ff; font-weight: bold; letter-spacing: 2px;")
         tl.addWidget(lbl)
         self.timeline_widget = pg.PlotWidget(); self.timeline_widget.setBackground("#161633")
         self.timeline_widget.setLabel("left",   "Count", color="#00f2ff")
@@ -788,27 +871,28 @@ class SOCDashboard(QMainWindow):
 
     def _build_tab_threat(self):
         tab = QWidget(); tl = QVBoxLayout(tab)
-        tl.setContentsMargins(4, 4, 4, 4)
+        tl.setContentsMargins(8, 8, 8, 8)
         lbl = QLabel("THREAT INTELLIGENCE — AbuseIPDB + AI Analysis")
-        lbl.setStyleSheet("font-size: 10px; color: #00f2ff; font-weight: bold; letter-spacing: 2px;")
+        lbl.setStyleSheet("font-size: 13px; color: #00f2ff; font-weight: bold; letter-spacing: 2px;")
         tl.addWidget(lbl)
         self.threat_table = QTableWidget(0, 8)
         self.threat_table.setHorizontalHeaderLabels(["IP","Combined","AI","AbuseIPDB","Risk Level","Country","ISP","AI Summary"])
         self.threat_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         tl.addWidget(self.threat_table)
+        self.threat_table.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
         self.tabs.addTab(tab, "🌐 Threat Intel")
 
     def _build_tab_reports(self):
         tab = QWidget(); tl = QVBoxLayout(tab)
-        tl.setContentsMargins(4, 4, 4, 4)
-        tl.setSpacing(4)
+        tl.setContentsMargins(8, 8, 8, 8)
+        tl.setSpacing(8)
 
         # ── Top bar ───────────────────────────────────────────────────────────
         top = QHBoxLayout()
         lbl = QLabel("AI INCIDENT REPORTS  —  deepseek-coder-v2:16b via Ollama")
-        lbl.setStyleSheet("font-size: 11px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
+        lbl.setStyleSheet("font-size: 13px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
         self.lbl_report_status = QLabel("")
-        self.lbl_report_status.setStyleSheet("font-size: 10px; color: #6c5ce7; font-family: 'Courier New';")
+        self.lbl_report_status.setStyleSheet("font-size: 12px; color: #6c5ce7; font-family: 'Courier New';")
         top.addWidget(lbl)
         top.addWidget(self.lbl_report_status)
         top.addStretch()
@@ -829,6 +913,7 @@ class SOCDashboard(QMainWindow):
         self.reports_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.reports_table.itemSelectionChanged.connect(self._show_report_detail)
         lf.addWidget(self.reports_table)
+        self.reports_table.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
         splitter.addWidget(list_frame)
 
         # ── Detail panel (bottom half) ────────────────────────────────────────
@@ -839,9 +924,9 @@ class SOCDashboard(QMainWindow):
 
         detail_header = QHBoxLayout()
         self.lbl_report_title = QLabel("Select a report above to view full analysis")
-        self.lbl_report_title.setStyleSheet("font-size: 12px; color: #00f2ff; font-weight: bold;")
+        self.lbl_report_title.setStyleSheet("font-size: 13px; color: #00f2ff; font-weight: bold;")
         self.lbl_report_confidence = QLabel("")
-        self.lbl_report_confidence.setStyleSheet("font-size: 11px; color: #ffa502; font-weight: bold;")
+        self.lbl_report_confidence.setStyleSheet("font-size: 12px; color: #ffa502; font-weight: bold;")
         detail_header.addWidget(self.lbl_report_title)
         detail_header.addStretch()
         detail_header.addWidget(self.lbl_report_confidence)
@@ -853,18 +938,20 @@ class SOCDashboard(QMainWindow):
         # Left column: summary + MITRE
         left_col = QVBoxLayout()
         lbl_sum = QLabel("ATTACK SUMMARY")
-        lbl_sum.setStyleSheet("font-size: 9px; color: #888; letter-spacing: 1px;")
+        lbl_sum.setStyleSheet("font-size: 11px; color: #888; letter-spacing: 1px;")
         self.report_summary = QTextEdit()
         self.report_summary.setReadOnly(True)
-        self.report_summary.setFixedHeight(80)
-        self.report_summary.setStyleSheet("background:#101028; color:#ffffff; border:1px solid #2e2e66; font-size:11px;")
+        self.report_summary.setMinimumHeight(100)
+        self.report_summary.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.report_summary.setStyleSheet("background:#101028; color:#ffffff; border:1px solid #2e2e66; font-size:12px;")
 
         lbl_mitre = QLabel("MITRE ATT&CK")
-        lbl_mitre.setStyleSheet("font-size: 9px; color: #888; letter-spacing: 1px; margin-top: 4px;")
+        lbl_mitre.setStyleSheet("font-size: 11px; color: #888; letter-spacing: 1px; margin-top: 4px;")
         self.report_mitre = QTextEdit()
         self.report_mitre.setReadOnly(True)
-        self.report_mitre.setFixedHeight(70)
-        self.report_mitre.setStyleSheet("background:#101028; color:#a29bfe; border:1px solid #2e2e66; font-size:11px;")
+        self.report_mitre.setMinimumHeight(90)
+        self.report_mitre.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.report_mitre.setStyleSheet("background:#101028; color:#a29bfe; border:1px solid #2e2e66; font-size:12px;")
 
         left_col.addWidget(lbl_sum)
         left_col.addWidget(self.report_summary)
@@ -875,18 +962,20 @@ class SOCDashboard(QMainWindow):
         # Right column: IOCs + actions
         right_col = QVBoxLayout()
         lbl_iocs = QLabel("IOCs")
-        lbl_iocs.setStyleSheet("font-size: 9px; color: #888; letter-spacing: 1px;")
+        lbl_iocs.setStyleSheet("font-size: 11px; color: #888; letter-spacing: 1px;")
         self.report_iocs = QTextEdit()
         self.report_iocs.setReadOnly(True)
-        self.report_iocs.setFixedHeight(60)
-        self.report_iocs.setStyleSheet("background:#101028; color:#ff4757; border:1px solid #2e2e66; font-size:11px;")
+        self.report_iocs.setMinimumHeight(80)
+        self.report_iocs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.report_iocs.setStyleSheet("background:#101028; color:#ff4757; border:1px solid #2e2e66; font-size:12px;")
 
         lbl_actions = QLabel("RECOMMENDED ACTIONS")
-        lbl_actions.setStyleSheet("font-size: 9px; color: #888; letter-spacing: 1px; margin-top: 4px;")
+        lbl_actions.setStyleSheet("font-size: 11px; color: #888; letter-spacing: 1px; margin-top: 4px;")
         self.report_actions = QTextEdit()
         self.report_actions.setReadOnly(True)
-        self.report_actions.setFixedHeight(90)
-        self.report_actions.setStyleSheet("background:#101028; color:#00ff88; border:1px solid #2e2e66; font-size:11px;")
+        self.report_actions.setMinimumHeight(110)
+        self.report_actions.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.report_actions.setStyleSheet("background:#101028; color:#00ff88; border:1px solid #2e2e66; font-size:12px;")
 
         right_col.addWidget(lbl_iocs)
         right_col.addWidget(self.report_iocs)
@@ -990,18 +1079,20 @@ class SOCDashboard(QMainWindow):
 
     def _build_tab_blocklist(self):
         tab = QWidget(); tl = QVBoxLayout(tab)
-        tl.setContentsMargins(4, 4, 4, 4)
-        tl.setSpacing(4)
+        tl.setContentsMargins(8, 8, 8, 8)
+        tl.setSpacing(8)
 
-        ctrl = QHBoxLayout(); ctrl.setSpacing(6)
+        ctrl = QHBoxLayout(); ctrl.setSpacing(8)
         self.inp_block_ip     = QLineEdit()
         self.inp_block_ip.setPlaceholderText("IP address to block  (e.g. 203.0.113.5)")
         self.inp_block_reason = QLineEdit()
         self.inp_block_reason.setPlaceholderText("Reason (optional)")
         self.lbl_block_err = QLabel("")
-        self.lbl_block_err.setStyleSheet("color:#ff4757; font-size:10px;")
+        self.lbl_block_err.setStyleSheet("color:#ff4757; font-size:12px;")
         btn_block   = QPushButton("BLOCK IP");          btn_block.setObjectName("danger");    btn_block.setFixedWidth(100)
         btn_unblock = QPushButton("UNBLOCK SELECTED");  btn_unblock.setStyleSheet("background:#2e2e66;"); btn_unblock.setFixedWidth(160)
+        btn_block.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_unblock.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_block.clicked.connect(self._manual_block)
         btn_unblock.clicked.connect(self._manual_unblock)
         ctrl.addWidget(self.inp_block_ip, 2)
@@ -1021,46 +1112,58 @@ class SOCDashboard(QMainWindow):
         self.blocklist_table.setAlternatingRowColors(True)
         self.blocklist_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         tl.addWidget(self.blocklist_table)
+        self.blocklist_table.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
 
         hint = QLabel("Click a row to select · Shift+Click or Ctrl+Click for multiple · then press UNBLOCK SELECTED")
-        hint.setStyleSheet("color:#444; font-size:10px;")
+        hint.setStyleSheet("color:#555; font-size:12px;")
         tl.addWidget(hint)
         self.tabs.addTab(tab, "🚫 Blocklist")
 
     def _build_tab_rules(self):
         tab = QWidget(); tl = QVBoxLayout(tab)
-        tl.setContentsMargins(4, 4, 4, 4)
-        tl.setSpacing(4)
+        tl.setContentsMargins(8, 8, 8, 8)
+        tl.setSpacing(8)
 
         top = QHBoxLayout()
         lbl = QLabel("RULE ENGINE v2 — Multi-condition · Multi-action · Priority · Cooldown")
-        lbl.setStyleSheet("font-size: 11px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
+        lbl.setStyleSheet("font-size: 13px; color: #00f2ff; font-weight: bold; letter-spacing: 1px;")
         btn_new = QPushButton("＋ NEW RULE"); btn_new.setObjectName("success"); btn_new.setFixedWidth(120)
+        btn_new.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_new.clicked.connect(self._new_rule)
         top.addWidget(lbl); top.addStretch(); top.addWidget(btn_new)
         tl.addLayout(top)
 
         self.rules_table = QTableWidget(0, 8)
         self.rules_table.setHorizontalHeaderLabels(
-            ["Pri", "Name", "Conditions", "Thr/Win", "Actions", "Cooldown", "On", ""]
+            ["Pri", "Name", "Conditions", "Thr/Win", "Actions", "Cooldown", "On", "Edit"]
         )
         hh = self.rules_table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        # All columns user-resizable; set initial widths so nothing is invisible
+        for col in range(8):
+            hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        hh.setMinimumSectionSize(36)
+        self.rules_table.setColumnWidth(0, 40)   # Pri
+        self.rules_table.setColumnWidth(1, 160)  # Name
+        self.rules_table.setColumnWidth(2, 300)  # Conditions (widest)
+        self.rules_table.setColumnWidth(3, 80)   # Thr/Win
+        self.rules_table.setColumnWidth(4, 130)  # Actions
+        self.rules_table.setColumnWidth(5, 90)   # Cooldown
+        self.rules_table.setColumnWidth(6, 44)   # On
+        self.rules_table.setColumnWidth(7, 60)   # Edit
         self.rules_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.rules_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.rules_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.rules_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.rules_table.setAlternatingRowColors(True)
         self.rules_table.cellDoubleClicked.connect(self._edit_rule_row)
         tl.addWidget(self.rules_table, 1)
+        self.rules_table.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
 
         btn_row = QHBoxLayout()
         btn_del  = QPushButton("DELETE SELECTED"); btn_del.setObjectName("danger"); btn_del.setFixedWidth(160)
         btn_edit = QPushButton("EDIT SELECTED");   btn_edit.setStyleSheet("background:#2e2e66;"); btn_edit.setFixedWidth(140)
+        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_edit.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_del.clicked.connect(self._delete_rule)
         btn_edit.clicked.connect(lambda: self._edit_rule_row(self.rules_table.currentRow(), 0))
         btn_row.addWidget(btn_edit); btn_row.addWidget(btn_del); btn_row.addStretch()
@@ -1070,12 +1173,12 @@ class SOCDashboard(QMainWindow):
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _make_stat_card(self, title, value, color):
-        card = QFrame(); card.setObjectName("Card"); card.setFixedSize(148, 72)
+        card = QFrame(); card.setObjectName("Card"); card.setFixedSize(172, 96)
         vl = QVBoxLayout(card)
-        vl.setContentsMargins(4, 4, 4, 4)
-        vl.setSpacing(2)
-        lbl_t = QLabel(title); lbl_t.setStyleSheet(f"font-size: 9px; color: {color};"); lbl_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_v = QLabel(value); lbl_v.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {color};"); lbl_v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vl.setContentsMargins(8, 8, 8, 8)
+        vl.setSpacing(4)
+        lbl_t = QLabel(title); lbl_t.setStyleSheet(f"font-size: 11px; color: {color};"); lbl_t.setAlignment(Qt.AlignmentFlag.AlignCenter); lbl_t.setWordWrap(True)
+        lbl_v = QLabel(value); lbl_v.setStyleSheet(f"font-size: 26px; font-weight: bold; color: {color};"); lbl_v.setAlignment(Qt.AlignmentFlag.AlignCenter)
         vl.addWidget(lbl_t); vl.addWidget(lbl_v)
         return card, lbl_v
 
@@ -1090,7 +1193,7 @@ class SOCDashboard(QMainWindow):
             widget = getattr(self, widget_name, None)
             if widget:
                 widget.setFont(font)
-                widget.verticalHeader().setDefaultSectionSize(max(22, self.gui_zoom + 12))
+                widget.verticalHeader().setDefaultSectionSize(max(28, self.gui_zoom + 16))
         if hasattr(self, "detail_text"):
             self.detail_text.setFont(QFont("Consolas", self.gui_zoom))
 
@@ -1242,14 +1345,87 @@ class SOCDashboard(QMainWindow):
                 f'⏳ AI report generating via deepseek-coder-v2:16b — updates automatically in ~30–60s</div>'
             )
 
-        # VT hash
+        # ── Enrichment panel ──────────────────────────────────────────────────
+        enrich_parts = []
+
+        # VT file hash
         if alert.get("vt_hash"):
-            vt_html = (
-                f'<span style="color:#fd79a8;">{e(alert["vt_hash"])}</span>'
-                + (f'&nbsp;&nbsp;<a href="{e(alert.get("vt_link",""))}" style="color:#6c5ce7;">View on VirusTotal ↗</a>'
-                   if alert.get("vt_link") else "")
+            vt_html = f'<span style="color:#fd79a8;">hash: {e(alert["vt_hash"])}</span>'
+            if alert.get("vt_link"):
+                vt_html += f'&nbsp;&nbsp;<a href="{e(alert["vt_link"])}" style="color:#6c5ce7;">VT ↗</a>'
+            if alert.get("vt_score", 0):
+                vt_html = f'<b style="color:#ff4757;">{alert["vt_score"]}/100</b>&nbsp;&nbsp;' + vt_html
+            enrich_parts.append(("VIRUSTOTAL FILE", "#fd79a8", vt_html))
+
+        # VT URL/domain
+        if alert.get("vt_url_score", 0):
+            vt_url_html = f'<b style="color:#ff4757;">{alert["vt_url_score"]}/100</b>'
+            if alert.get("vt_url_link"):
+                vt_url_html += f'&nbsp;&nbsp;<a href="{e(alert["vt_url_link"])}" style="color:#6c5ce7;">VT ↗</a>'
+            enrich_parts.append(("VIRUSTOTAL URL/DOMAIN", "#fd79a8", vt_url_html))
+
+        # Shodan
+        if alert.get("shodan_score", 0) or alert.get("shodan_ports") or alert.get("shodan_vulns"):
+            sh_score = alert.get("shodan_score", 0)
+            col = "#ff4757" if sh_score >= 50 else "#ffa502" if sh_score >= 20 else "#74b9ff"
+            ports = e(alert.get("shodan_ports", "") or "none")
+            vulns = e(alert.get("shodan_vulns", "") or "none")
+            sh_html = (
+                f'<b style="color:{col};">score: {sh_score}/100</b>'
+                f'&nbsp;&nbsp;<span style="color:#888;">open ports:</span> '
+                f'<span style="color:#74b9ff;">{ports[:80]}</span>'
             )
-            html.append(section("VIRUSTOTAL HASH", vt_html))
+            if alert.get("shodan_vulns"):
+                sh_html += (
+                    f'<br><span style="color:#888;">CVEs:</span> '
+                    f'<span style="color:#ff4757;">{vulns[:120]}</span>'
+                )
+            enrich_parts.append(("SHODAN", col, sh_html))
+
+        # GreyNoise
+        if alert.get("greynoise_score", 0) or alert.get("greynoise_classification"):
+            gn_class = (alert.get("greynoise_classification") or "unknown").upper()
+            gn_score = alert.get("greynoise_score", 0)
+            gn_col   = {"MALICIOUS": "#ff0000", "BENIGN": "#00ff88"}.get(gn_class, "#ffa502")
+            gn_html  = (
+                f'<b style="color:{gn_col};">{gn_class}</b>'
+                f'&nbsp;&nbsp;<span style="color:#888;">score: {gn_score}/100</span>'
+            )
+            if gn_class == "BENIGN":
+                gn_html += '&nbsp;&nbsp;<span style="color:#555;">(known benign infrastructure)</span>'
+            enrich_parts.append(("GREYNOISE", gn_col, gn_html))
+
+        # URLScan
+        if alert.get("urlscan_score", 0) or alert.get("urlscan_verdict"):
+            us_verdict = (alert.get("urlscan_verdict") or "unknown").upper()
+            us_score   = alert.get("urlscan_score", 0)
+            us_col     = "#ff4757" if us_verdict == "MALICIOUS" else "#00ff88" if us_verdict == "CLEAN" else "#ffa502"
+            us_html    = f'<b style="color:{us_col};">{us_verdict}</b>&nbsp;&nbsp;<span style="color:#888;">score: {us_score}/100</span>'
+            if alert.get("urlscan_link"):
+                us_html += f'&nbsp;&nbsp;<a href="{e(alert["urlscan_link"])}" style="color:#6c5ce7;">Report ↗</a>'
+            enrich_parts.append(("URLSCAN.IO SANDBOX", us_col, us_html))
+
+        if enrich_parts:
+            enrich_rows = "".join(
+                f'<tr><td style="color:{tc};font-size:9px;letter-spacing:1px;'
+                f'padding:3px 8px 3px 0;white-space:nowrap;vertical-align:top;">'
+                f'▶ {title}</td>'
+                f'<td style="padding:3px 0 3px 8px;">{content}</td></tr>'
+                for title, tc, content in enrich_parts
+            )
+            html.append(
+                f'<div style="background:#0c0c22;border:1px solid #2e2e66;border-radius:4px;'
+                f'padding:6px 8px;margin:6px 0;">'
+                f'<div style="color:#00f2ff;font-size:9px;letter-spacing:2px;margin-bottom:4px;">'
+                f'THREAT ENRICHMENT</div>'
+                f'<table width="100%" cellspacing="0" cellpadding="0">{enrich_rows}</table>'
+                f'</div>'
+            )
+        elif any(k in alert for k in ("shodan_score","greynoise_score","urlscan_score","vt_url_score")):
+            html.append(
+                f'<div style="color:#333;font-size:10px;font-style:italic;margin:4px 0;">'
+                f'⏳ Enrichment pending (Shodan / GreyNoise / URLScan) — updates automatically</div>'
+            )
 
         # Raw log — always at the bottom
         raw = e(str(alert.get("raw_log") or "Raw log not stored for this incident."))
@@ -1430,14 +1606,21 @@ class SOCDashboard(QMainWindow):
             return
         rules = get_rules_v2(self.db_path)
         self._rules_data = rules
+
+        # Remember which rule IDs were selected so we can restore after rebuild
+        selected_ids = set()
+        for idx in self.rules_table.selectedIndexes():
+            row = idx.row()
+            if row < len(self._rules_data):
+                selected_ids.add(self._rules_data[row].get("id"))
+
         self.rules_table.clearContents()
         self.rules_table.setRowCount(len(rules))
 
-        act_icons  = {"action_block": "🚫", "action_email": "📧",
-                      "action_quarantine": "🔒", "action_escalate": "⬆"}
+        act_icons = {"action_block": "🚫", "action_email": "📧",
+                     "action_quarantine": "🔒", "action_escalate": "⬆"}
 
         for i, r in enumerate(rules):
-            # conditions summary
             try:
                 conds = json.loads(r.get("conditions", "[]"))
                 mode  = r.get("condition_mode", "AND")
@@ -1448,7 +1631,6 @@ class SOCDashboard(QMainWindow):
             except Exception:
                 cond_txt = r.get("conditions", "")[:60]
 
-            # actions badge
             acts = " ".join(v for k, v in act_icons.items() if r.get(k))
             if r.get("action_webhook"):
                 acts += " 🌐"
@@ -1470,7 +1652,6 @@ class SOCDashboard(QMainWindow):
                                           "#00f2ff" if j == 1 else "#cccccc"))
                 self.rules_table.setItem(i, j, item)
 
-            # Enabled toggle
             chk = QCheckBox(); chk.setChecked(bool(r["enabled"]))
             rule_id = r["id"]
             chk.stateChanged.connect(
@@ -1478,11 +1659,21 @@ class SOCDashboard(QMainWindow):
             )
             self.rules_table.setCellWidget(i, 6, chk)
 
-            # Edit button
             btn = QPushButton("Edit")
             btn.setStyleSheet("background:#2e2e66; padding:2px 6px; font-size:10px;")
             btn.clicked.connect(lambda _, row=i: self._edit_rule_row(row))
             self.rules_table.setCellWidget(i, 7, btn)
+
+        # Restore selection
+        if selected_ids:
+            self.rules_table.blockSignals(True)
+            for i, r in enumerate(rules):
+                if r.get("id") in selected_ids:
+                    self.rules_table.selectRow(i)
+            self.rules_table.blockSignals(False)
+
+        self.rules_table.resizeColumnsToContents()
+        self.rules_table.setColumnWidth(2, max(self.rules_table.columnWidth(2), 240))  # Conditions min width
 
     # ── Blocklist ─────────────────────────────────────────────────────────────
 
@@ -1524,6 +1715,14 @@ class SOCDashboard(QMainWindow):
         if not self.db_path:
             return
         bl = get_blocklist(self.db_path)
+
+        # Remember selected IPs before rebuilding
+        selected_ips = set()
+        for idx in self.blocklist_table.selectedIndexes():
+            item = self.blocklist_table.item(idx.row(), 0)
+            if item:
+                selected_ips.add(item.text())
+
         self.blocklist_table.clearContents()
         self.blocklist_table.setRowCount(len(bl))
         for i, entry in enumerate(bl):
@@ -1535,6 +1734,15 @@ class SOCDashboard(QMainWindow):
                 item = QTableWidgetItem(val)
                 item.setForeground(QColor("#ff4757" if j == 0 else "#cccccc"))
                 self.blocklist_table.setItem(i, j, item)
+
+        # Restore selection
+        if selected_ips:
+            self.blocklist_table.blockSignals(True)
+            for i, entry in enumerate(bl):
+                if entry.get("ip") in selected_ips:
+                    self.blocklist_table.selectRow(i)
+            self.blocklist_table.blockSignals(False)
+
         self.lbl_blocked.setText(str(len(bl)))
 
     # ── Alert Processing ──────────────────────────────────────────────────────
@@ -1685,6 +1893,10 @@ class SOCDashboard(QMainWindow):
             for j, (item, c) in enumerate(cells):
                 item.setForeground(QColor(c)); self.table.setItem(i, j, item)
 
+        if filtered:
+            self.table.resizeColumnsToContents()
+            self.table.horizontalHeader().setStretchLastSection(True)
+
     # ── Stats tab ─────────────────────────────────────────────────────────────
 
     def update_stats_tab(self, data):
@@ -1826,23 +2038,79 @@ class SOCDashboard(QMainWindow):
             print(f"[MAP ERROR] {e}")
 
     def generate_pdf_report(self):
-        try:
-            pdf = FPDF(); pdf.add_page()
-            pdf.set_font("Arial","B",16)
-            pdf.cell(200,10,"SOC SECURITY INCIDENT REPORT",ln=True,align="C")
-            pdf.set_font("Arial",size=8)
-            pdf.cell(200,6,f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  Operator: {self.username}  |  Role: {self.role}",ln=True,align="C")
-            pdf.ln(6); pdf.set_font("Arial","B",9)
-            pdf.cell(0,8,"Timestamp | IP | Country | Event | Severity | Threat Score | Status",ln=True)
-            pdf.set_font("Arial",size=8)
-            for i in range(self.table.rowCount()):
-                def _get(col): return self.table.item(i,col).text() if self.table.item(i,col) else "N/A"
-                ts,ip,country,event,sev,threat,status = [_get(c) for c in range(7)]
-                pdf.cell(0,7,f"[{ts}] {ip} | {country} | {event} | {sev} | {threat} | {status}",ln=True)
-            pdf.output("Security_Report.pdf")
-            QMessageBox.information(self,"Success","PDF Generated: Security_Report.pdf")
-        except Exception as e:
-            QMessageBox.critical(self,"Error",f"Failed: {e}")
+        # ── Time range picker dialog ──────────────────────────────────────────
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Generate Security Report")
+        dlg.setStyleSheet(STYLE_SOC)
+        dlg.setFixedSize(380, 200)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(10)
+
+        lay.addWidget(QLabel("Select coverage window and output path:"))
+
+        form = QFormLayout()
+        spn_hours = QSpinBox()
+        spn_hours.setRange(1, 720)
+        spn_hours.setValue(24)
+        spn_hours.setSuffix(" hours")
+        form.addRow("Coverage:", spn_hours)
+
+        inp_path = QLineEdit("Security_Report.pdf")
+        form.addRow("Output file:", inp_path)
+        lay.addLayout(form)
+
+        note = QLabel("Ollama (deepseek-coder-v2:16b) will write the executive\n"
+                      "summary. Generation takes ~60–90 seconds.")
+        note.setStyleSheet("color:#6c5ce7; font-size:10px;")
+        lay.addWidget(note)
+
+        btns = QHBoxLayout()
+        btn_ok  = QPushButton("GENERATE"); btn_ok.setObjectName("success")
+        btn_can = QPushButton("CANCEL");   btn_can.setStyleSheet("background:#444;")
+        btn_ok.clicked.connect(dlg.accept)
+        btn_can.clicked.connect(dlg.reject)
+        btns.addStretch(); btns.addWidget(btn_ok); btns.addWidget(btn_can)
+        lay.addLayout(btns)
+
+        if not dlg.exec():
+            return
+
+        hours       = spn_hours.value()
+        output_path = inp_path.text().strip() or "Security_Report.pdf"
+
+        # Show progress indicator
+        self.btn_report.setEnabled(False)
+        self.btn_report.setText("GENERATING...")
+        self.lbl_action.setText("⏳ Building PDF with Ollama executive summary...")
+
+        def _done(path, error):
+            # Must update GUI on main thread
+            QTimer.singleShot(0, lambda: self._on_pdf_done(path, error, output_path))
+
+        generate_pdf(
+            db_path=self.db_path,
+            output_path=output_path,
+            operator=self.username,
+            role=self.role,
+            hours=hours,
+            callback=_done,
+        )
+
+    def _on_pdf_done(self, path, error, output_path):
+        self.btn_report.setEnabled(True)
+        self.btn_report.setText("EXPORT PDF")
+        self.lbl_action.setText("")
+        if error:
+            QMessageBox.critical(self, "PDF Failed", f"Generation failed:\n{error}")
+        else:
+            QMessageBox.information(self, "Report Ready",
+                f"PDF saved to:\n{output_path}\n\n"
+                "Contents:\n"
+                "  • Cover page with risk level & executive summary\n"
+                "  • Statistics (severity breakdown, top IPs, event types)\n"
+                "  • Incident cards with AI analysis & MITRE ATT&CK\n"
+                "  • Recommendations & immediate actions\n"
+                "  • Blocked IP appendix")
 
 
 if __name__ == "__main__":

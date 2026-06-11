@@ -9,8 +9,8 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QFrame, QMessageBox, QGraphicsDropShadowEffect
 )
-from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, pyqtSignal
-from PyQt6.QtGui import QFont, QColor, QPainter, QPen, QLinearGradient, QBrush, QPixmap, QPalette
+from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, pyqtSignal, QSize
+from PyQt6.QtGui import QFont, QColor, QPainter, QPen, QLinearGradient, QBrush, QPixmap, QPalette, QPainterPath
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "incidents.db")
 
@@ -35,25 +35,25 @@ QLabel#title {
 QLabel#subtitle {
     color: #4a4a8a;
     font-family: 'Courier New';
-    font-size: 11px;
+    font-size: 12px;
     letter-spacing: 3px;
 }
 QLabel#field_label {
     color: #6060a0;
     font-family: 'Courier New';
-    font-size: 10px;
+    font-size: 12px;
     letter-spacing: 2px;
 }
 QLabel#error_label {
     color: #ff4757;
     font-family: 'Courier New';
-    font-size: 10px;
+    font-size: 12px;
     letter-spacing: 1px;
 }
 QLabel#success_label {
     color: #00ff88;
     font-family: 'Courier New';
-    font-size: 10px;
+    font-size: 12px;
     letter-spacing: 1px;
 }
 QLineEdit#input_field {
@@ -62,6 +62,7 @@ QLineEdit#input_field {
     border: 1px solid #1e1e4a;
     border-radius: 8px;
     padding: 12px 16px;
+    min-height: 22px;
     font-family: 'Courier New';
     font-size: 13px;
     selection-background-color: #6c5ce7;
@@ -97,19 +98,6 @@ QPushButton#btn_login:disabled {
     background: #1e1e4a;
     color: #3a3a6a;
 }
-QPushButton#btn_toggle {
-    background: transparent;
-    color: #4a4a8a;
-    border: none;
-    font-family: 'Courier New';
-    font-size: 10px;
-    letter-spacing: 1px;
-    padding: 2px;
-    text-align: right;
-}
-QPushButton#btn_toggle:hover {
-    color: #00f2ff;
-}
 QLabel#role_badge {
     background-color: #1a1a40;
     color: #6c5ce7;
@@ -117,7 +105,7 @@ QLabel#role_badge {
     border-radius: 4px;
     padding: 2px 8px;
     font-family: 'Courier New';
-    font-size: 9px;
+    font-size: 11px;
     letter-spacing: 2px;
 }
 """
@@ -250,6 +238,89 @@ class BlinkLabel(QLabel):
         self.setVisible(self._show)
 
 
+# ── Password field with inline eye icon ───────────────────────────────────────
+
+class _EyeButton(QPushButton):
+    """Paints open/closed eye directly — no external assets needed."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._visible = False          # password currently visible?
+        self.setFixedSize(32, 32)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet("background: transparent; border: none;")
+        self.setToolTip("Toggle password visibility")
+
+    def set_visible(self, v: bool):
+        self._visible = v
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx, cy = self.width() // 2, self.height() // 2
+
+        color = QColor("#00f2ff")
+        pen = QPen(color, 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        # Outer eye almond
+        path = QPainterPath()
+        path.moveTo(cx - 9, cy)
+        path.cubicTo(cx - 9, cy - 5, cx - 4, cy - 7, cx, cy - 7)
+        path.cubicTo(cx + 4, cy - 7, cx + 9, cy - 5, cx + 9, cy)
+        path.cubicTo(cx + 9, cy + 5, cx + 4, cy + 7, cx, cy + 7)
+        path.cubicTo(cx - 4, cy + 7, cx - 9, cy + 5, cx - 9, cy)
+        p.drawPath(path)
+
+        if self._visible:
+            # Pupil (filled circle)
+            p.setBrush(QBrush(color))
+            p.drawEllipse(cx - 3, cy - 3, 6, 6)
+        else:
+            # Iris ring only (hollow)
+            p.drawEllipse(cx - 3, cy - 3, 6, 6)
+            # Strike-through slash
+            slash_pen = QPen(color, 1.6)
+            slash_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(slash_pen)
+            p.drawLine(cx - 8, cy + 7, cx + 8, cy - 7)
+
+
+class PasswordLineEdit(QLineEdit):
+    """QLineEdit with an embedded eye-icon toggle button."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("input_field")
+        self.setEchoMode(QLineEdit.EchoMode.Password)
+
+        self._eye = _EyeButton(self)
+        self._eye.clicked.connect(self._toggle)
+        self._reposition()
+
+    def _toggle(self):
+        showing = self.echoMode() == QLineEdit.EchoMode.Normal
+        self.setEchoMode(
+            QLineEdit.EchoMode.Password if showing else QLineEdit.EchoMode.Normal
+        )
+        self._eye.set_visible(not showing)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reposition()
+
+    def _reposition(self):
+        bw = self._eye.width()
+        bh = self._eye.height()
+        self._eye.move(self.width() - bw - 6, (self.height() - bh) // 2)
+        # Right padding so text doesn't slide under the icon
+        self.setTextMargins(0, 0, bw + 8, 0)
+
+
 # ── Login Window ──────────────────────────────────────────────────────────────
 
 class LoginWindow(QMainWindow):
@@ -261,17 +332,17 @@ class LoginWindow(QMainWindow):
         init_users_table(db_path)
 
         self.setWindowTitle("SOC SIEM PRO — Secure Access")
-        self.setFixedSize(480, 580)
+        self.setFixedSize(480, 600)
         self.setStyleSheet(STYLE)
 
         # Animated grid background
         self.bg = GridBackground(self)
-        self.bg.setGeometry(0, 0, 480, 580)
+        self.bg.setGeometry(0, 0, 480, 600)
 
         # Central card
         self.card = QFrame(self)
         self.card.setObjectName("card")
-        self.card.setGeometry(50, 80, 380, 420)
+        self.card.setGeometry(50, 80, 380, 440)
 
         shadow = QGraphicsDropShadowEffect()
         shadow.setBlurRadius(60)
@@ -317,28 +388,18 @@ class LoginWindow(QMainWindow):
         self.inp_user.setPlaceholderText("Enter username...")
         self.inp_user.returnPressed.connect(self.attempt_login)
         layout.addWidget(self.inp_user)
+        layout.addSpacing(10)
 
         # Password
         lbl_pass = QLabel("ACCESS KEY")
         lbl_pass.setObjectName("field_label")
         layout.addWidget(lbl_pass)
 
-        pass_row = QHBoxLayout()
-        pass_row.setSpacing(0)
-        self.inp_pass = QLineEdit()
-        self.inp_pass.setObjectName("input_field")
+        self.inp_pass = PasswordLineEdit()
         self.inp_pass.setPlaceholderText("Enter password...")
-        self.inp_pass.setEchoMode(QLineEdit.EchoMode.Password)
         self.inp_pass.returnPressed.connect(self.attempt_login)
-
-        self.btn_toggle = QPushButton("SHOW")
-        self.btn_toggle.setObjectName("btn_toggle")
-        self.btn_toggle.setFixedWidth(45)
-        self.btn_toggle.clicked.connect(self.toggle_password)
-
-        pass_row.addWidget(self.inp_pass)
-        pass_row.addWidget(self.btn_toggle)
-        layout.addLayout(pass_row)
+        layout.addWidget(self.inp_pass)
+        layout.addSpacing(10)
 
         # Feedback label
         self.lbl_feedback = QLabel("")
@@ -350,6 +411,7 @@ class LoginWindow(QMainWindow):
         self.btn_login = QPushButton("AUTHENTICATE")
         self.btn_login.setObjectName("btn_login")
         self.btn_login.setFixedHeight(46)
+        self.btn_login.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_login.clicked.connect(self.attempt_login)
         layout.addWidget(self.btn_login)
 
@@ -375,7 +437,7 @@ class LoginWindow(QMainWindow):
         status_row.addWidget(cursor)
 
         bottom = QWidget(self)
-        bottom.setGeometry(50, 515, 380, 30)
+        bottom.setGeometry(50, 535, 380, 30)
         bottom.setStyleSheet("background: transparent;")
         bl = QHBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 0, 0)
@@ -385,23 +447,15 @@ class LoginWindow(QMainWindow):
         bl.addWidget(cursor)
 
         # Entry animation
-        self.card.setGeometry(50, 140, 380, 420)
+        self.card.setGeometry(50, 140, 380, 440)
         self._anim = QPropertyAnimation(self.card, b"geometry")
         self._anim.setDuration(600)
-        self._anim.setStartValue(QRect(50, 140, 380, 420))
-        self._anim.setEndValue(QRect(50, 80, 380, 420))
+        self._anim.setStartValue(QRect(50, 140, 380, 440))
+        self._anim.setEndValue(QRect(50, 80, 380, 440))
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         QTimer.singleShot(100, self._anim.start)
 
         self._fail_count = 0
-
-    def toggle_password(self):
-        if self.inp_pass.echoMode() == QLineEdit.EchoMode.Password:
-            self.inp_pass.setEchoMode(QLineEdit.EchoMode.Normal)
-            self.btn_toggle.setText("HIDE")
-        else:
-            self.inp_pass.setEchoMode(QLineEdit.EchoMode.Password)
-            self.btn_toggle.setText("SHOW")
 
     def attempt_login(self):
         username = self.inp_user.text().strip()

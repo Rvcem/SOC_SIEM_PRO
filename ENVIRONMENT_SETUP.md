@@ -18,29 +18,34 @@ cp .env.example .env
 Then open `.env` and add:
 
 ```
-# VirusTotal (required for malware detection)
+# VirusTotal (file hash + URL/domain lookups)
 VT_API_KEY=your-api-key-from-virustotal.com
 
-# AbuseIPDB (optional, for IP reputation)
+# AbuseIPDB (IP reputation)
 ABUSEIPDB_API_KEY=your-api-key-from-abuseipdb.com
 
-# Ollama (required for AI analysis)
+# Ollama (required for AI analysis — run `ollama serve` first)
 OLLAMA_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=llama3.1
-SOC_REPORT_MODEL=deepseek-coder-v2:16b
+SOC_REPORT_MODEL=deepseek:latest
+
+# Threat enrichment (optional but recommended)
+SHODAN_API_KEY=your-shodan-key
+GREYNOISE_API_KEY=your-greynoise-key   # or leave blank — Community API works without a key
+URLSCAN_API_KEY=your-urlscan-key
 ```
 
 ### 3. Install Ollama & models
 
-Download Ollama from https://ollama.ai, then:
+Download Ollama from https://ollama.ai, then pull the two models used by the app:
 
 ```bash
-ollama pull llama3.1
-ollama pull deepseek-coder-v2:16b
+ollama pull llama3.1           # real-time heuristic scoring (OLLAMA_MODEL)
+ollama pull deepseek:latest    # incident report generation (SOC_REPORT_MODEL)
 ollama serve
 ```
 
-Keep Ollama running in the background while the SIEM is active.
+`deepseek:latest` is significantly faster than `deepseek-coder-v2:16b` for this task. If you have a powerful machine and prefer deeper analysis you can set `SOC_REPORT_MODEL=deepseek-coder-v2:16b` in `.env` — just expect 60–120 s per report.
 
 ### 4. Start the system
 
@@ -60,15 +65,20 @@ The SIEM will:
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `VT_API_KEY` | Optional | (none) | VirusTotal hash lookups (get at virustotal.com) |
-| `ABUSEIPDB_API_KEY` | Optional | (none) | IP reputation (get at abuseipdb.com) |
+| `VT_API_KEY` | Optional | (none) | VirusTotal hash + URL/domain lookups |
+| `ABUSEIPDB_API_KEY` | Optional | (none) | IP reputation (abuseipdb.com) |
+| `SHODAN_API_KEY` | Optional | (none) | Open ports + CVEs on source IPs (Port Scan / Recon events) |
+| `GREYNOISE_API_KEY` | Optional | (none) | Mass-scanner classification — Community API works without a key |
+| `URLSCAN_API_KEY` | Optional | (none) | URL sandbox with screenshot (C2 / web attack events) |
 | `OLLAMA_URL` | Optional | `http://127.0.0.1:11434` | Ollama local LLM endpoint |
 | `OLLAMA_MODEL` | Optional | `llama3.1` | Model for real-time analysis |
-| `SOC_REPORT_MODEL` | Optional | `deepseek-coder-v2:16b` | Model for incident reports |
+| `SOC_REPORT_MODEL` | Optional | `deepseek:latest` | Model for per-incident reports |
 | `SOC_ENABLE_OLLAMA` | Optional | `1` | Set to `0` to disable LLM analysis |
 | `SOC_ENABLE_REPORTS` | Optional | `1` | Set to `0` to disable report generation |
-| `SOC_AUTO_BLOCK_SCORE` | Optional | `90` | Threat score threshold for auto-block (0-100) |
+| `SOC_AUTO_BLOCK_SCORE` | Optional | `90` | Threat score threshold for auto-block (0–100) |
+| `SOC_ADMIN_PASSWORD` | Optional | (auto-generated) | First-run admin password — printed to console if not set |
 | `SOC_DB_PATH` | Optional | `incidents.db` | Path to SQLite database |
+| `SOC_API_KEY` | Optional | (auto-generated) | Bearer token for Flask REST API |
 
 ---
 
@@ -87,6 +97,27 @@ The SIEM will:
 3. Go to **Account** → **API** → copy your API key
 4. Add to `.env`: `ABUSEIPDB_API_KEY=...`
 5. **Rate limit:** 1,000 lookups per day (free tier)
+
+### Shodan (Free Tier)
+1. Go to https://account.shodan.io/register
+2. Create an account — the free plan gives 100 lookups/month
+3. Copy your API key from the **Account** page
+4. Add to `.env`: `SHODAN_API_KEY=...`
+5. Triggered by: Port Scan and Reconnaissance events
+
+### GreyNoise (Community API — no key required)
+1. Leave `GREYNOISE_API_KEY=` blank to use the free Community API (basic mass-scanner classification)
+2. For enhanced data, register at https://www.greynoise.io/plans/community
+3. Add to `.env`: `GREYNOISE_API_KEY=...`
+4. Triggered by: Port Scan, Bruteforce, DDoS, and Anomaly events
+
+### URLScan.io (Free Tier)
+1. Go to https://urlscan.io/user/signup
+2. Create an account
+3. Copy your API key from **Settings** → **API Key**
+4. Add to `.env`: `URLSCAN_API_KEY=...`
+5. **Rate limit:** 100 private scans per day (free tier)
+6. Triggered by: C2 Communication, SQLi, XSS, Command Injection, Malware events
 
 ---
 
