@@ -69,7 +69,8 @@ SOC-SIEM PRO blends statistical analysis, unsupervised learning, and stateful be
 ├── test_siem.py                  # Multi-vector attack simulator
 ├── threat_intel.py               # AbuseIPDB integration and local cache
 ├── .env.example                  # Environment variable template
-└── ENVIRONMENT_SETUP.md          # Detailed API key setup guide
+├── ENVIRONMENT_SETUP.md          # Detailed API key setup guide
+└── VM_DEPLOYMENT.md              # Three-VM lab setup (Attacker / Target / SIEM)
 ```
 
 ## Run
@@ -86,13 +87,16 @@ cp .env.example .env
 ```
 
 ### 3. Start Ollama
-The app connects to a locally running Ollama instance for AI-powered report generation.
+
+The app connects to a locally running Ollama instance for AI-powered analysis and report generation.
 Ollama must be started **before** launching the app:
+
 ```bash
+ollama pull deepseek:latest
 ollama serve
 ```
 
-> If Ollama is not running, the app still works — report generation is silently skipped.
+> If Ollama is not running, the app still works — AI analysis and report generation are silently skipped.
 
 ### 4. Start The Integrated App
 ```bash
@@ -117,7 +121,12 @@ Use `admin` as the username and that printed password. To set a fixed password, 
 python test_siem.py
 ```
 
-## System Architecture
+## Documentation
+
+- [Environment Setup & API Keys](ENVIRONMENT_SETUP.md) — detailed setup guide, all env vars, API key registration steps
+- [VM Deployment Guide](VM_DEPLOYMENT.md) — three-VM lab setup: Attacker (Kali) / Target / SIEM
+
+
 ```mermaid
 graph TD
     A[Attack Source] -->|UDP 5555| B[SIEM Engine]

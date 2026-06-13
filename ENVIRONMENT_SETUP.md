@@ -26,7 +26,7 @@ ABUSEIPDB_API_KEY=your-api-key-from-abuseipdb.com
 
 # Ollama (required for AI analysis — run `ollama serve` first)
 OLLAMA_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=llama3.1
+OLLAMA_MODEL=deepseek:latest
 SOC_REPORT_MODEL=deepseek:latest
 
 # Threat enrichment (optional but recommended)
@@ -37,15 +37,18 @@ URLSCAN_API_KEY=your-urlscan-key
 
 ### 3. Install Ollama & models
 
-Download Ollama from https://ollama.ai, then pull the two models used by the app:
+Download Ollama from https://ollama.ai, then pull the model used by the app:
 
 ```bash
-ollama pull llama3.1           # real-time heuristic scoring (OLLAMA_MODEL)
-ollama pull deepseek:latest    # incident report generation (SOC_REPORT_MODEL)
+ollama pull deepseek:latest    # used for both chatbot and incident reports
 ollama serve
 ```
 
-`deepseek:latest` is significantly faster than `deepseek-coder-v2:16b` for this task. If you have a powerful machine and prefer deeper analysis you can set `SOC_REPORT_MODEL=deepseek-coder-v2:16b` in `.env` — just expect 60–120 s per report.
+If you have a powerful machine and want deeper analysis, you can use the larger model:
+```bash
+ollama pull deepseek-coder-v2:16b
+```
+Then set `SOC_REPORT_MODEL=deepseek-coder-v2:16b` in `.env` — expect 60–120s per report.
 
 ### 4. Start the system
 
@@ -71,8 +74,8 @@ The SIEM will:
 | `GREYNOISE_API_KEY` | Optional | (none) | Mass-scanner classification — Community API works without a key |
 | `URLSCAN_API_KEY` | Optional | (none) | URL sandbox with screenshot (C2 / web attack events) |
 | `OLLAMA_URL` | Optional | `http://127.0.0.1:11434` | Ollama local LLM endpoint |
-| `OLLAMA_MODEL` | Optional | `llama3.1` | Model for real-time analysis |
-| `SOC_REPORT_MODEL` | Optional | `deepseek:latest` | Model for per-incident reports |
+| `OLLAMA_MODEL` | Optional | `deepseek:latest` | Model for SOC Assist chatbot |
+| `SOC_REPORT_MODEL` | Optional | `deepseek:latest` | Model for per-incident AI reports |
 | `SOC_ENABLE_OLLAMA` | Optional | `1` | Set to `0` to disable LLM analysis |
 | `SOC_ENABLE_REPORTS` | Optional | `1` | Set to `0` to disable report generation |
 | `SOC_AUTO_BLOCK_SCORE` | Optional | `90` | Threat score threshold for auto-block (0–100) |
