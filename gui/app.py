@@ -625,6 +625,7 @@ class SOCDashboard(QMainWindow):
     _threat_ready   = pyqtSignal(str)
     _action_signal  = pyqtSignal(str, str)
     _chat_reply_sig = pyqtSignal(str)   # Ollama chat response → main thread
+    _pdf_done_sig   = pyqtSignal(str, str, str)  # (path|"", error|"", output_path) → main thread
 
     def __init__(self, username="operator", role="analyst", db_path=None, api_key=None):
         super().__init__()
@@ -1571,6 +1572,7 @@ class SOCDashboard(QMainWindow):
         self._chat_history  = []
         self._chat_typing   = False
         self._chat_reply_sig.connect(self._on_chat_reply)
+        self._pdf_done_sig.connect(self._on_pdf_sig)
 
         tab = QWidget(); tl = QVBoxLayout(tab)
         tl.setContentsMargins(8, 8, 8, 8)
@@ -1896,6 +1898,8 @@ class SOCDashboard(QMainWindow):
             label if label else "No incident selected.\nSelect a row in\nLive Alerts tab.")
 
     def _chat_quick(self, action_key):
+        if self._chat_typing:
+            return
         ctx, _ = self._chat_get_incident_ctx()
         no_sel = "No incident is selected. Please click a row in the **Live Alerts** tab first."
 
@@ -2605,8 +2609,9 @@ class SOCDashboard(QMainWindow):
         self.lbl_action.setText("⏳ Building PDF with Ollama executive summary...")
 
         def _done(path, error):
-            # Must update GUI on main thread
-            QTimer.singleShot(0, lambda: self._on_pdf_done(path, error, output_path))
+            # Emit signal — safe cross-thread GUI update (QTimer.singleShot is unreliable
+            # from daemon threads that have no Qt event loop)
+            self._pdf_done_sig.emit(path or "", error or "", output_path)
 
         generate_pdf(
             db_path=self.db_path,
@@ -2632,6 +2637,10 @@ class SOCDashboard(QMainWindow):
                 "  • Incident cards with AI analysis & MITRE ATT&CK\n"
                 "  • Recommendations & immediate actions\n"
                 "  • Blocked IP appendix")
+
+    def _on_pdf_sig(self, path, error, output_path):
+        """Slot for _pdf_done_sig — receives cross-thread PDF callback safely."""
+        self._on_pdf_done(path or None, error or None, output_path)
 
 
 if __name__ == "__main__":
