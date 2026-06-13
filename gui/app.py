@@ -1816,14 +1816,34 @@ class SOCDashboard(QMainWindow):
         def _worker():
             try:
                 url   = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-                model = os.getenv("OLLAMA_MODEL", "llama3.1")
-                resp  = requests.post(
+                model = os.getenv("OLLAMA_MODEL", "deepseek:latest")
+                # Use streaming so we get tokens as they arrive — avoids timing out
+                # while waiting in the queue behind background report generation.
+                resp = requests.post(
                     f"{url}/api/chat",
-                    json={"model": model, "messages": messages, "stream": False},
-                    timeout=120)
-                data    = resp.json()
-                content = (data.get("message") or {}).get("content")
+                    json={"model": model, "messages": messages, "stream": True},
+                    stream=True,
+                    timeout=(10, 60))  # (connect, read-per-chunk)
+                chunks = []
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        part = json.loads(line)
+                    except Exception:
+                        continue
+                    token = (part.get("message") or {}).get("content", "")
+                    if token:
+                        chunks.append(token)
+                    if part.get("done"):
+                        break
+                content = "".join(chunks)
                 if not content:
+                    # Non-streaming error path (e.g. model not found)
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = {}
                     err = data.get("error", "")
                     if err:
                         content = f"Ollama error: {err}"

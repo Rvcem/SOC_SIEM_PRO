@@ -22,12 +22,21 @@ import os
 import re
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
 OLLAMA_URL    = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 REPORT_MODEL  = os.getenv("SOC_REPORT_MODEL", "deepseek-coder-v2:16b")
 ENABLE_REPORTS = os.getenv("SOC_ENABLE_REPORTS", "1").lower() not in ("0", "false", "no")
+
+# Single-worker pool: only one report runs at a time so chat requests aren't
+# starved. Queue depth 4 — incidents beyond that are silently skipped rather
+# than piling up and blocking Ollama for minutes.
+_report_pool = ThreadPoolExecutor(max_workers=1)
+_report_queue_depth = 0
+_report_queue_lock  = threading.Lock()
+_REPORT_MAX_QUEUE   = 4
 
 # ── DB setup ──────────────────────────────────────────────────────────────────
 
@@ -220,24 +229,33 @@ def generate_report_async(
 ):
     """
     Fire-and-forget: generate an Ollama report for this incident in the background.
-    Does nothing if SOC_ENABLE_REPORTS=0 or the event is LOW severity and score < 30
-    (avoids flooding Ollama with benign events).
+    Does nothing if SOC_ENABLE_REPORTS=0 or the event is LOW severity and score < 30.
+    Capped at _REPORT_MAX_QUEUE pending jobs to avoid starving the chat assistant.
     """
+    global _report_queue_depth
     if not ENABLE_REPORTS:
         return
-
-    # Skip trivial events to keep Ollama load reasonable
     if severity.upper() == "LOW" and threat_score < 30:
         return
 
-    threading.Thread(
-        target=_generate_report,
-        args=(
-            db_path, incident_id, raw_log, source_ip, event_type,
-            severity, threat_score, behavior_alerts or [], vt_score, vt_hash,
-        ),
-        daemon=True,
-    ).start()
+    with _report_queue_lock:
+        if _report_queue_depth >= _REPORT_MAX_QUEUE:
+            print(f"[REPORTER] Queue full — dropping report for incident {incident_id}")
+            return
+        _report_queue_depth += 1
+
+    def _run():
+        global _report_queue_depth
+        try:
+            _generate_report(
+                db_path, incident_id, raw_log, source_ip, event_type,
+                severity, threat_score, behavior_alerts or [], vt_score, vt_hash,
+            )
+        finally:
+            with _report_queue_lock:
+                _report_queue_depth -= 1
+
+    _report_pool.submit(_run)
 
 
 # ── Query helpers ─────────────────────────────────────────────────────────────
